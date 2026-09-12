@@ -12,12 +12,20 @@ Reclassification MUST NOT remove client-visible retry guidance. A rejection that
 
 Message matching MUST be punctuation-insensitive and MUST NOT depend on the HTTP status, because upstream delivers this message both as an HTTP body and as a serialized `response.failed` frame that carries no status.
 
+Serialized `response.failed` frames that carry code-less or `invalid_request_error` usage-limit messages MUST enter the same classifier and account-exclusion path before the terminal-frame gate decides the response. The absence of `upstream_error` from transport retry-code allowlists MUST NOT bypass the pool walk for those frames.
+
 #### Scenario: Code-less usage-limit 429 rotates instead of backing off
 
 - **WHEN** upstream answers with HTTP `429` whose body carries no error code and whose message asserts the usage limit has been reached
 - **THEN** `classify_upstream_failure` returns `failure_class = "rate_limit"`
 - **AND** the failure is not a burst rejection
 - **AND** an unbound request excludes the account and continues the pool walk instead of waiting 1 s / 2 s / 4 s on it
+
+#### Scenario: Code-less usage-limit response.failed frame rotates
+
+- **WHEN** upstream serializes a pre-visible `response.failed` frame with no error code and a message asserting the usage limit has been reached
+- **THEN** the streaming path classifies it with the same usage-limit evidence as the HTTP-body form
+- **AND** an unbound request excludes the account and continues the pool walk before surfacing a terminal frame
 
 #### Scenario: Usage-limit message under a non-rate-limit code still rotates
 

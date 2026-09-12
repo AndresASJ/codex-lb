@@ -10,7 +10,7 @@ The walk MUST terminate. Termination MUST be guaranteed by three independent bou
 
 The monotone-progress invariant governs failover outcomes only. An account-capacity recovery that deliberately re-admits a previously excluded account — waiting for a local cap to clear rather than rejecting the account — MUST be allowed to remove its own exclusion, MUST NOT be reported as a progress failure, and MUST remain bounded by the request budget. A walk that could re-admit an account on failover evidence would not terminate; a walk that could not re-admit on capacity evidence would lose a recovery path that exists today.
 
-The proxy MUST record account health exactly once per attempted account per request. A walk across N accounts MUST produce N health writes, not N writes per attempt.
+The proxy MUST record account health exactly once per attempted failover outcome. A walk across N accounts whose pre-visible failures each produce one `failover_next` outcome MUST produce N health writes. Same-account retry and post-refresh paths that perform another upstream dispatch on the same account MAY record that distinct dispatch result, as required by their existing retry-health contract; they MUST NOT duplicate a health write for the same dispatch outcome.
 
 Owner-bound requests are outside the relocation part of this requirement: a request that cannot move to another account MUST continue to return through the `owner_bound` branch and MUST NOT walk the pool. Burst rejections may still use the bounded same-account retry path. Usage-limit messages, including code-less and `invalid_request_error` envelopes, still use the new classification and same-account-backoff skip before their original rejection is surfaced.
 

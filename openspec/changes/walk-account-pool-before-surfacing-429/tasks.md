@@ -67,9 +67,11 @@
 - [ ] `_service/streaming/retry.py`: convert the bounded
   `for attempt in range(max_attempts)` loop to a guarded walk; record
   `last_account_failure` where the verbatim `raise` stands today (both the
-  pre-visible site and its post-forced-refresh twin); raise through
-  `resolve_pool_terminal_failure` at the terminal point; add the
-  monotone-progress check and its `pool_walk_no_progress` warning.
+  pre-visible site and its post-forced-refresh twin); route serialized
+  code-less or `invalid_request_error` usage-limit `response.failed` frames into
+  the classifier/exclusion decision before the terminal-frame gate can surface
+  them; raise through `resolve_pool_terminal_failure` at the terminal point; add
+  the monotone-progress check and its `pool_walk_no_progress` warning.
 - [ ] `_service/websocket/mixin.py` and `_service/compact.py`: same walk shape;
   pass `owner_bound` and `same_account_retry_available` on the websocket path,
   which omits them today.
@@ -90,9 +92,13 @@
   serves the client with three dispatches and three health writes; all accounts
   exhausted yields one `usage_limit_reached` 429 with `error.resets_at` and one
   probe call; a `non_retryable` failure mid-walk surfaces immediately; an
-  owner-bound burst 429 never walks; a drain strategy preserves the bounded
-  drain walk's per-account failure; a selector that returns an excluded account triggers
-  `pool_walk_no_progress`.
+  owner-bound burst 429 never walks; a serialized code-less usage-limit
+  `response.failed` frame walks before surfacing; a drain strategy preserves
+  the bounded drain walk's per-account failure; a selector that returns an
+  excluded account triggers `pool_walk_no_progress`.
+- [ ] Add product-path walk, exhaustion, and owner-bound coverage for both
+  `_service/websocket/mixin.py` and `_service/compact.py`, including the
+  transport-specific terminal rendering and settlement behavior.
 - [ ] `tests/unit/test_streaming_retry_virtual_time.py`: the walk adds no wall
   time between attempts and deadline exhaustion mid-walk terminates with
   `upstream_request_timeout`, not a 429.
@@ -100,8 +106,9 @@
   invoked at most once per request from the terminal path.
 - [ ] `tests/simulation/test_proxy_turn_lifecycle_property.py`: for any sequence
   of failover exclusions, dispatches are bounded, the excluded set is strictly
-  monotone, and there is exactly one health write per attempted account. Cover
-  capacity recovery separately as the allowed re-admission exception.
+  monotone, and there is exactly one health write per failover dispatch outcome.
+  Cover capacity recovery and post-refresh same-account retries separately as
+  allowed additional dispatch outcomes, not duplicate writes for one outcome.
 - [ ] Confirm the `[settings_fields]` ratchet does not move and no new
   `CODEX_LB_*` name is introduced.
 - [ ] `openspec validate --specs`, `uv run ruff check`,
