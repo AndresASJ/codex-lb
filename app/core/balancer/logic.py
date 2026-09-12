@@ -980,7 +980,7 @@ def _relative_availability_weighted_candidates(
     current: float,
     power: float,
     top_k: int,
-    selection_seed: str | None = None,
+    membership_seed: str | None = None,
 ) -> list[tuple[AccountState, float, float]]:
     raw_scores = [(state, _relative_availability_raw_score(state, current)) for state in available]
     _log_relative_availability_candidate_scores(raw_scores, current=current)
@@ -993,6 +993,9 @@ def _relative_availability_weighted_candidates(
     for state, raw_score in raw_scores:
         normalized_score = raw_score / best_raw_score
         weight = normalized_score**safe_power
+        # The floor is an eligibility bound, not a ranking, so it applies to a
+        # seeded caller too: a retained thread must not be parked on an account
+        # that has fallen far behind the best available one.
         if weight < RELATIVE_AVAILABILITY_MIN_WEIGHT_FRACTION:
             continue
         weighted.append((state, weight, raw_score))
@@ -1000,33 +1003,24 @@ def _relative_availability_weighted_candidates(
     if not weighted:
         return []
 
-    # ``_usage_sort_key`` ends in ``last_selected_at``, so exact ties are
-    # broken by *recency*: each admitted turn advances the winner's timestamp
-    # and ejects it from the top-k on the next turn. A caller that needs the
-    # same answer every turn would then cycle through the tied siblings, so it
-    # gets a membership rule that does not move -- keyed by its own seed, not
-    # globally, or every thread would be handed the same k accounts and the
-    # rest of an equally-scored pool would never serve a retained turn.
-    weighted.sort(
-        key=lambda item: (
-            -item[1],
-            -item[2],
-            *(
-                (_decorrelated_tie_breaker(item[0].account_id, selection_seed),)
-                if selection_seed is not None
-                else _usage_sort_key(item[0])
-            ),
-        )
-    )
-    # A seeded caller takes every candidate above the minimum weight fraction,
-    # not the top ``k``. The slice is a *rank* cut over live availability, so a
-    # sibling can stay well within reach and still drop out of it the moment
-    # another account's usage refreshes -- and a retained thread would follow
-    # that reordering off its substitute. The fraction floor is the eligibility
-    # bound that survives here: it moves only when an account genuinely falls
-    # away from the best, which is a change in the pool rather than a
+    if membership_seed is not None:
+        # ``_usage_sort_key`` ends in ``last_selected_at``, so exact ties are
+        # broken by *recency*: each admitted turn advances the winner's
+        # timestamp and ejects it from the top-k on the next turn. Ordering by
+        # the caller's own seed instead is stable turn to turn, and keyed per
+        # thread rather than globally -- otherwise every retained conversation
+        # is handed the same k accounts and the rest of an equally scored pool
+        # never serves a turn.
+        weighted.sort(key=lambda item: _decorrelated_tie_breaker(item[0].account_id, membership_seed))
+    else:
+        weighted.sort(key=lambda item: (-item[1], -item[2], *_usage_sort_key(item[0])))
+    # The ``k`` cut is a *rank* cut over live availability, so a sibling can
+    # stay well within reach and still drop out of it when another account's
+    # usage refreshes. A seeded caller keeps every candidate above the minimum
+    # weight fraction instead: that floor moves only when an account genuinely
+    # falls away from the best, which is a change in the pool rather than a
     # reshuffle of it.
-    safe_top_k = len(weighted) if selection_seed is not None else max(1, top_k)
+    safe_top_k = len(weighted) if membership_seed is not None else max(1, top_k)
     top_candidates = weighted[:safe_top_k]
     _log_relative_availability_top_k(top_candidates, current=current)
     return top_candidates
@@ -1067,7 +1061,7 @@ def _select_relative_availability(
         current=current,
         power=power,
         top_k=top_k,
-        selection_seed=selection_seed,
+        membership_seed=selection_seed,
     )
     if not weighted_candidates:
         winner = (
