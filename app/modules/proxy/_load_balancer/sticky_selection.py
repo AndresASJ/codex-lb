@@ -1481,6 +1481,12 @@ async def _select_with_stickiness(
     # further down, so the caller's intent is captured before that happens.
     caller_requested_reallocation = reallocate_sticky
     overload_reroute_request_local = False
+    # A mapping kept because the conversation's owner is *ambiguous* is not a
+    # warm owner waiting out isolation: it may sit outside this request's
+    # routable or security scope. It still keeps its row -- ambiguity is a
+    # reason not to rebind -- but it must not have its TTL extended by a turn
+    # served elsewhere, and it is not an isolation release to count.
+    retention_may_write = not preserve_existing_mapping_on_fallback or preserve_reason_request_local
 
     def _choose_from(candidates: list[AccountState], *, selection_seed: str | None = None) -> SelectionResult:
         return _select_account_preferring_budget_safe(
@@ -1673,12 +1679,14 @@ async def _select_with_stickiness(
                     # ``mapping=retained`` is the attributable marker for the
                     # accounts-per-conversation factor: it says this turn went
                     # to a sibling *without* adding an owner to the thread.
-                    logger.info(
-                        "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
-                        sticky_kind.value,
-                        len(overload_reroute_pool),
-                        "retained" if overload_reroute_request_local else "rebound",
-                    )
+                    if retention_may_write or not overload_reroute_request_local:
+                        logger.info(
+                            "sticky_owner_overload_isolation_reroute sticky_kind=%s "
+                            "overload_free_candidates=%d mapping=%s",
+                            sticky_kind.value,
+                            len(overload_reroute_pool),
+                            "retained" if overload_reroute_request_local else "rebound",
+                        )
                 else:
                     overload_reroute_pool = None
 
@@ -1806,7 +1814,7 @@ async def _select_with_stickiness(
                 # accumulation this change exists to remove, arriving through
                 # the back door. Rewrite the same owner instead: the row stays
                 # on the warm account and its freshness tracks the thread.
-                if sticky_max_age_seconds is not None:
+                if sticky_max_age_seconds is not None and retention_may_write:
                     pending_mutation = _StickyMutation(
                         account_id=pinned.account_id,
                         refresh_skip_deadline=sticky_refresh_skip_deadline,

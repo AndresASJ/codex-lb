@@ -1641,6 +1641,37 @@ async def test_request_local_isolation_release_is_logged_as_retained(
 
 
 @pytest.mark.asyncio
+async def test_an_ambiguously_owned_pinned_mapping_is_kept_but_not_extended(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ambiguity is a reason not to rebind, not a reason to hold on harder.
+
+    The owner still keeps its row -- that is what preserving it means -- but a
+    turn served elsewhere must not extend the TTL of a mapping the request
+    could not confirm, and it is not an isolation release to count.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("hot"), _state("clean")],
+        _sticky_repo("hot"),
+        preserve_existing_mapping_on_fallback=True,
+        preserve_reason_request_local=False,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.selection.account.account_id == "clean"
+    assert outcome.mutation is None, "the row is kept as-is, neither rebound nor refreshed"
+    messages = [record.getMessage() for record in caplog.records]
+    assert not [message for message in messages if "sticky_owner_overload_isolation_reroute" in message], messages
+
+
+@pytest.mark.asyncio
 async def test_ordinary_spillover_keeps_its_load_proportional_draw() -> None:
     """Stability is bought for a reason, and only where there is one.
 
