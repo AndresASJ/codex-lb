@@ -1090,14 +1090,19 @@ def _select_relative_availability(
             raw_score=_relative_availability_raw_score(winner, current),
         )
         return winner
-    winner = (
+    if selection_seed is not None:
         # Inside the top-k the draw has already been narrowed by availability;
-        # the seed only makes the pick stable for its caller. Zero-weight
-        # candidates are dropped for the same reason as in the capacity draw.
-        _seeded_account([state for state, weight in zip(states, weights, strict=True) if weight > 0.0], selection_seed)
-        if selection_seed is not None
-        else random.choices(states, weights=weights, k=1)[0]
-    )
+        # the seed only makes the pick stable for its caller, and keeps the
+        # weights' proportions across threads. Zero-weight candidates are
+        # dropped for the same reason as in the capacity draw.
+        live = [(state, weight) for state, weight in zip(states, weights, strict=True) if weight > 0.0]
+        winner = _seeded_weighted_account(
+            [state for state, _ in live],
+            [weight for _, weight in live],
+            selection_seed,
+        )
+    else:
+        winner = random.choices(states, weights=weights, k=1)[0]
     for state, weight, raw_score in weighted_candidates:
         if state.account_id == winner.account_id:
             _log_relative_availability_winner(winner, current=current, weight=weight, raw_score=raw_score)
@@ -1108,6 +1113,40 @@ def _select_relative_availability(
 def _seeded_account(pool: list[AccountState], seed: str) -> AccountState:
     """The seed's choice among candidates the strategy was about to draw from."""
     return min(pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, seed))
+
+
+def _seeded_weighted_account(
+    pool: list[AccountState],
+    weights: list[float],
+    seed: str,
+) -> AccountState:
+    """Weighted rendezvous hashing: stable per seed, weighted across seeds.
+
+    A plain keyed-hash pick would give a candidate weighted 0.01 the same share
+    as one weighted 1.0 -- stable, but no longer capacity- or error-rate-aware
+    once you look across threads. Scoring each candidate ``w / -ln(u)`` with
+    ``u`` a per-(seed, account) uniform reproduces the weighted draw's
+    distribution over seeds while keeping any single seed's answer fixed.
+
+    Zero-weight candidates are excluded by the caller for the same reason the
+    weighted draw could never return them.
+    """
+    best: tuple[float, str] | None = None
+    winner = pool[0]
+    for state, weight in zip(pool, weights, strict=True):
+        digest = hashlib.blake2b(
+            f"{seed}\x00{state.account_id}".encode("utf-8", "surrogatepass"),
+            digest_size=8,
+        ).digest()
+        # Open interval: ln(0) is undefined and ln(1) is 0.
+        uniform = min(max(int.from_bytes(digest, "big") / 2**64, 1e-18), 1.0 - 1e-16)
+        score = weight / -math.log(uniform)
+        # The account id breaks exact ties so replicas agree.
+        key = (score, state.account_id)
+        if best is None or key > best:
+            best = key
+            winner = state
+    return winner
 
 
 def _seeded_least_used(available: list[AccountState], seed: str) -> AccountState:
@@ -1278,9 +1317,12 @@ def _select_capacity_weighted(
     if selection_seed is not None:
         # A zero-weight account is one the draw could never have returned while
         # a positive-weight sibling existed -- an account whose effective
-        # secondary credits are spent. The seed must not readmit it.
-        return _seeded_account(
-            [state for state, weight in zip(available, weights, strict=True) if weight > 0.0],
+        # secondary credits are spent. The seed must not readmit it, and must
+        # keep the remaining weights' proportions across threads.
+        live = [(state, weight) for state, weight in zip(available, weights, strict=True) if weight > 0.0]
+        return _seeded_weighted_account(
+            [state for state, _ in live],
+            [weight for _, weight in live],
             selection_seed,
         )
     return random.choices(available, weights=weights, k=1)[0]

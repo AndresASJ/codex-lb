@@ -968,6 +968,41 @@ def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
             assert by_reset.account.account_id == "soon", f"{strategy} took the later reset bucket"
 
 
+def test_a_seeded_pick_still_follows_the_draw_s_weights_across_threads() -> None:
+    """Stable for one thread, weighted across many.
+
+    A plain keyed hash would give an account with 1% of the remaining capacity
+    the same share as one with 99% -- each thread's answer fixed, but the fleet
+    no longer capacity-aware. Weighted rendezvous hashing keeps both.
+    """
+
+    now = 2_000_000_000.0
+    large, small = _state("large"), _state("small")
+    large.capacity_credits = 1000.0
+    large.secondary_used_percent = 1.0
+    small.capacity_credits = 1000.0
+    small.secondary_used_percent = 97.0
+
+    picks = []
+    for index in range(400):
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        result = select_account([large, small], now, routing_strategy="capacity_weighted", selection_seed=seed)
+        assert result.account is not None
+        picks.append(result.account.account_id)
+
+    large_share = picks.count("large") / len(picks)
+    # ~33x the remaining credits; an unweighted hash would sit at ~0.5.
+    assert large_share > 0.9, large_share
+    # And each thread's own answer is still fixed.
+    seed = isolation_substitute_seed(sticky_key="thread-7", owner_account_id="owner")
+    repeated = set()
+    for _ in range(8):
+        again = select_account([large, small], now, routing_strategy="capacity_weighted", selection_seed=seed)
+        assert again.account is not None
+        repeated.add(again.account.account_id)
+    assert len(repeated) == 1
+
+
 def test_a_seeded_pick_leaves_fill_first_s_ranking_alone() -> None:
     """``fill_first`` drains an account before opening the next.
 
@@ -1172,7 +1207,7 @@ async def test_a_permanent_isolation_release_is_logged_as_rebound(
 
     messages = [record.getMessage() for record in caplog.records]
     released = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert released, messages
+    assert len(released) == 1, messages
     assert "mapping=rebound" in released[0]
     assert "hot" not in released[0] and "clean" not in released[0]
 
@@ -1599,7 +1634,7 @@ async def test_request_local_isolation_release_is_logged_as_retained(
     _assert_owner_retained(outcome, "hot")
     messages = [record.getMessage() for record in caplog.records]
     retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert retained, messages
+    assert len(retained) == 1, messages
     assert "mapping=retained" in retained[0]
     # Account identifiers must not leak onto this unflagged diagnostic.
     assert "hot" not in retained[0] and "clean" not in retained[0]
@@ -1695,7 +1730,7 @@ async def test_a_capped_isolated_owner_s_release_is_logged_as_retained_too(
     assert outcome.selection.account is not None
     messages = [record.getMessage() for record in caplog.records]
     retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert retained, messages
+    assert len(retained) == 1, messages
     assert "mapping=retained" in retained[0]
     assert "hot" not in retained[0] and "clean" not in retained[0]
 

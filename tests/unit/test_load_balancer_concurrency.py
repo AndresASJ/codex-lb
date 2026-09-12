@@ -3547,7 +3547,7 @@ async def test_an_isolated_owner_dropped_before_selection_is_still_counted(
     assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
     messages = [record.getMessage() for record in caplog.records]
     released = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert released, messages
+    assert len(released) == 1, messages
     assert "mapping=rebound" in released[0]
     assert owner.id not in released[0] and alternate.id not in released[0]
     await balancer.release_account_lease(selected.lease)
