@@ -1091,14 +1091,19 @@ def _select_relative_availability(
         )
         return winner
     if selection_seed is not None:
-        # Inside the top-k the draw has already been narrowed by availability;
-        # the seed only makes the pick stable for its caller, and keeps the
-        # weights' proportions across threads. Zero-weight candidates are
-        # dropped for the same reason as in the capacity draw.
-        live = [(state, weight) for state, weight in zip(states, weights, strict=True) if weight > 0.0]
-        winner = _seeded_weighted_account(
-            [state for state, _ in live],
-            [weight for _, weight in live],
+        # Inside the top-k the draw has already been narrowed by availability,
+        # and membership is stable for a seeded caller (see
+        # ``stable_membership``), so the seed picks uniformly among the
+        # survivors. Unlike the capacity draw, these weights are *normalized*
+        # against the current best score: they move whenever any account's
+        # availability moves, including the retained thread's own substitute as
+        # it serves. Weighting the pick by them would put every thread one
+        # admission away from flipping, which is the rotation the seed exists
+        # to prevent -- so here the narrowing carries the availability
+        # preference and the seed only chooses among what survived it.
+        # Zero-weight candidates are dropped as in the capacity draw.
+        winner = _seeded_account(
+            [state for state, weight in zip(states, weights, strict=True) if weight > 0.0],
             selection_seed,
         )
     else:
@@ -1122,11 +1127,22 @@ def _seeded_weighted_account(
 ) -> AccountState:
     """Weighted rendezvous hashing: stable per seed, weighted across seeds.
 
-    A plain keyed-hash pick would give a candidate weighted 0.01 the same share
-    as one weighted 1.0 -- stable, but no longer capacity- or error-rate-aware
-    once you look across threads. Scoring each candidate ``w / -ln(u)`` with
-    ``u`` a per-(seed, account) uniform reproduces the weighted draw's
-    distribution over seeds while keeping any single seed's answer fixed.
+    Two requirements pull against each other here. A plain keyed-hash pick
+    gives a candidate weighted 0.01 the same share as one weighted 1.0 --
+    stable, but no longer capacity- or error-rate-aware once you look across
+    threads. Scoring each candidate ``w / -ln(u)``, with ``u`` a
+    per-(seed, account) uniform, reproduces the weighted draw's distribution
+    over seeds -- but the weights themselves move as the pool is used, and a
+    caller that needs the same answer every turn would see its pick flip the
+    moment its own admission spent some of that account's credits.
+
+    So the weight is quantized to its power-of-two bucket before scoring. Two
+    accounts an order of magnitude apart stay an order of magnitude apart in
+    the draw, while the drift a single conversation causes inside an isolation
+    window -- a few percent of an account's remaining credits -- cannot move
+    the score at all. A pick can still change when an account genuinely halves
+    its remaining capacity, which is a real change in the pool rather than the
+    self-inflicted rotation the seed exists to prevent.
 
     Zero-weight candidates are excluded by the caller for the same reason the
     weighted draw could never return them.
@@ -1140,7 +1156,7 @@ def _seeded_weighted_account(
         ).digest()
         # Open interval: ln(0) is undefined and ln(1) is 0.
         uniform = min(max(int.from_bytes(digest, "big") / 2**64, 1e-18), 1.0 - 1e-16)
-        score = weight / -math.log(uniform)
+        score = 2.0 ** math.floor(math.log2(weight)) / -math.log(uniform)
         # The account id breaks exact ties so replicas agree.
         key = (score, state.account_id)
         if best is None or key > best:

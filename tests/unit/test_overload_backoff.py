@@ -18,6 +18,7 @@ from app.core.balancer.logic import (
     ROUTING_POLICY_PRESERVE,
     AccountState,
     RoutingCost,
+    RoutingStrategy,
     select_account,
 )
 from app.core.config.settings import get_settings
@@ -1001,6 +1002,48 @@ def test_a_seeded_pick_still_follows_the_draw_s_weights_across_threads() -> None
         assert again.account is not None
         repeated.add(again.account.account_id)
     assert len(repeated) == 1
+
+
+@pytest.mark.parametrize("strategy", ["capacity_weighted", "relative_availability"])
+def test_a_seeded_pick_survives_its_own_consumption(strategy: RoutingStrategy) -> None:
+    """Weighting must not reintroduce the rotation it was added alongside.
+
+    The weights move as the pool is used, and the retained thread is one of the
+    things using it. Scoring raw credits leaves every thread one admission away
+    from flipping -- whichever ones happen to hold a narrow lead over their
+    runner-up -- so a conversation's own turns walk it off its substitute
+    inside a single isolation window: exactly the fan-out being removed. The
+    score is taken from the weight's coarse bucket instead, so consumption on
+    this scale cannot move it for *any* thread.
+    """
+
+    now = 2_000_000_000.0
+
+    def _pool() -> list[AccountState]:
+        pool = []
+        for index in range(5):
+            state = _state(f"sibling-{index}")
+            state.capacity_credits = 1000.0
+            # ~900 remaining: comfortably inside one bucket, so the drop below
+            # is real consumption rather than a genuine change in capacity tier.
+            state.secondary_used_percent = 10.0
+            pool.append(state)
+        return pool
+
+    flipped = []
+    for index in range(200):
+        pool = _pool()
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        first = select_account(pool, now, routing_strategy=strategy, selection_seed=seed)
+        assert first.account is not None
+        # What serving a stretch of turns costs the account that served them.
+        first.account.secondary_used_percent = 40.0
+        second = select_account(pool, now, routing_strategy=strategy, selection_seed=seed)
+        assert second.account is not None
+        if second.account.account_id != first.account.account_id:
+            flipped.append((first.account.account_id, second.account.account_id))
+
+    assert not flipped, f"{len(flipped)}/200 threads left their substitute after serving: {flipped[:5]}"
 
 
 def test_a_seeded_pick_leaves_fill_first_s_ranking_alone() -> None:
