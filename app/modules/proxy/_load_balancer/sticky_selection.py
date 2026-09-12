@@ -29,9 +29,8 @@ from app.db.models import Account, AccountStatus, AdditionalUsageHistory, Sticky
 from app.db.snapshot import clone_row
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.proxy._load_balancer.overload_backoff import (
-    budget_peer_pool,
-    deterministic_isolation_substitute,
     filter_overload_backoff_candidates,
+    isolation_substitute_seed,
     overload_backoff_active,
     overload_isolation_active,
     sticky_owner_isolation_reroute_pool,
@@ -1466,24 +1465,10 @@ async def _select_with_stickiness(
     caller_requested_reallocation = reallocate_sticky
     overload_reroute_request_local = False
 
-    def _above_choose_from_budget_threshold(state: AccountState) -> bool:
-        """The exact over-budget predicate ``_choose_from`` filters its pool with.
-
-        Mirroring the selector matters: its notion of over-budget reads priority
-        and secondary usage, so a stand-in that only compared ``used_percent``
-        would readmit an account exhausted on an axis it cannot see.
-        """
-        if apply_sticky_secondary_budget_threshold:
-            return _state_above_sticky_budget_threshold(
-                state,
-                budget_threshold_pct,
-                secondary_budget_threshold_pct,
-            )
-        return _state_above_budget_threshold(state, budget_threshold_pct)
-
-    def _choose_from(candidates: list[AccountState]) -> SelectionResult:
+    def _choose_from(candidates: list[AccountState], *, selection_seed: str | None = None) -> SelectionResult:
         return _select_account_preferring_budget_safe(
             candidates,
+            selection_seed=selection_seed,
             prefer_earlier_reset=prefer_earlier_reset_accounts,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
@@ -1638,45 +1623,28 @@ async def _select_with_stickiness(
                 if budget_pressured:
                     apply_sticky_secondary_budget_threshold = True
                 # The release is request-local, so this pick is repeated on
-                # every turn of the thread while isolation holds. Prefer the
-                # sticky key's deterministic substitute over a fresh weighted
-                # draw, and let the real selector veto it: running the
-                # selector on the single candidate applies exactly the
-                # strategy, health, quota and budget gates the pool pick
-                # would, so an ineligible substitute simply falls back to the
-                # pool and the pool can never be emptied by this preference.
-                # The pool pick first: it is what the selector considers best
-                # over the *whole* pool, and several of its gates are
-                # pool-relative -- ``_select_account_preferring_budget_safe``
-                # accepts an over-budget account when no safe alternative is
-                # visible, and a draining one when nothing else is. Running
-                # the selector on the substitute alone would therefore hide
-                # exactly those filters and could pin the thread to an
-                # 85%-used sibling while a 20%-used one sat in the pool.
-                candidate = _choose_from(overload_reroute_pool)
-                substitute_is_stable = False
-                if candidate.account is not None:
-                    # Hash over the pool pick's own budget tier, not the raw
-                    # pool. The selector's budget filter is pool-relative --
-                    # it accepts an over-budget account only when no safe one
-                    # is visible -- so hashing over everything and validating
-                    # the winner alone would hide that filter entirely. Scoping
-                    # the hash keeps the spread (a preference among equally
-                    # safe siblings) while making the threshold uncrossable.
-                    substitute = deterministic_isolation_substitute(
-                        budget_peer_pool(
-                            overload_reroute_pool,
-                            candidate.account,
-                            is_above_budget_threshold=_above_choose_from_budget_threshold,
-                        ),
+                # every turn of the thread while isolation holds. A plain
+                # weighted draw would answer differently each time and rotate
+                # the conversation across the siblings -- more churn than the
+                # single rebind this change replaces -- so the pick is seeded
+                # by the thread instead.
+                #
+                # The seed is spent *inside* the selector, among the accounts
+                # it would otherwise draw from, rather than picking a
+                # substitute here and asking the selector to ratify it: every
+                # gate the selector applies is pool-relative (it accepts an
+                # over-budget account only when no safe one is visible, a
+                # draining one only when nothing healthier is, a ``preserve``
+                # one only when no ``normal`` one is), and validating a single
+                # candidate hides all of them.
+                candidate = _choose_from(
+                    overload_reroute_pool,
+                    selection_seed=isolation_substitute_seed(
                         sticky_key=sticky_key,
                         owner_account_id=pinned.account_id,
-                    )
-                    if substitute is not None:
-                        substitute_result = _choose_from([substitute])
-                        if substitute_result.account is not None:
-                            candidate = substitute_result
-                            substitute_is_stable = True
+                    ),
+                )
+                substitute_is_stable = candidate.account is not None
                 if candidate.account is not None and candidate.account.account_id != pinned.account_id:
                     overload_reroute = candidate
                     overload_reroute_request_local = not caller_requested_reallocation
@@ -1869,30 +1837,41 @@ async def _select_with_stickiness(
         # -- cap-filtered or excluded by this request's retry loop, so it never
         # reached ``selection_states`` and the isolation branch above could not
         # see a ``pinned`` state -- the substitute is re-picked on every turn
-        # just as it is there. An ordinary pool pick would rotate the thread
-        # across the siblings under round-robin, which is more churn than the
-        # single rebind this change replaces. Give those paths the same stable
-        # substitute, head-to-head against the pool pick so every pool-relative
-        # gate still applies.
-        if (
-            preserve_existing_mapping_on_fallback
-            and isinstance(existing, str)
-            and chosen.account is not None
-            and chosen.account.account_id != existing
-        ):
-            stable = deterministic_isolation_substitute(
-                budget_peer_pool(
-                    fallback_candidates,
-                    chosen.account,
-                    is_above_budget_threshold=_above_choose_from_budget_threshold,
-                ),
-                sticky_key=sticky_key,
-                owner_account_id=existing,
+        # just as it is there, so it gets the same thread-seeded pick. The seed
+        # is spent inside the selector, so the pool-relative gates all hold.
+        if preserve_existing_mapping_on_fallback and isinstance(existing, str) and chosen.account is not None:
+            seeded = _choose_from(
+                fallback_candidates,
+                selection_seed=isolation_substitute_seed(sticky_key=sticky_key, owner_account_id=existing),
             )
-            if stable is not None and stable.account_id != chosen.account.account_id:
-                stable_result = _choose_from([stable])
-                if stable_result.account is not None:
-                    chosen = stable_result
+            if seeded.account is not None:
+                chosen = seeded
+    if (
+        pending_mutation is None
+        and sticky_max_age_seconds is not None
+        and isinstance(existing, str)
+        and not persist_fallback
+        and not reallocate_sticky
+        and overload_backoff_runtime is not None
+        and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
+    ):
+        # The owner is isolated and its mapping is being kept, but it never
+        # reached ``selection_states`` -- a cap or this request's exclusion
+        # list removed it -- so the retention branch above could not see a
+        # ``pinned`` state and scheduled no write. Preserving must not mean
+        # going silent on a TTL-based kind: the default affinity TTL and the
+        # default isolation window are both 1800 seconds, so a retained row
+        # left unwritten expires *during* the episode and the next turn
+        # persists the substitute as a brand-new owner -- the accumulation
+        # this change removes, arriving through the back door.
+        #
+        # Scoped to isolation on purpose. When an owner is merely rate-limited
+        # the TTL expiring *is* the intended escape, and refreshing it would
+        # hold a conversation on an account that may never come back.
+        pending_mutation = _StickyMutation(
+            account_id=existing,
+            refresh_skip_deadline=sticky_refresh_skip_deadline,
+        )
     chosen_pool = fallback_candidates if fallback_candidates is not states else None
     if persist_fallback and chosen.account is not None and chosen.account.account_id in account_map:
         return finish_selection(chosen, persist_account_id=chosen.account.account_id, effective_states=chosen_pool)
@@ -2145,6 +2124,7 @@ def _select_account_preferring_budget_safe(
     routing_costs_by_account_id: RoutingCostsByAccount | None = None,
     allow_usage_exhaustion_error: bool = True,
     usage_exhaustion_states: Iterable[AccountState] | None = None,
+    selection_seed: str | None = None,
 ) -> SelectionResult:
     state_list = list(states)
     if routing_strategy not in ("sequential_drain", "reset_drain", "single_account"):
@@ -2198,6 +2178,7 @@ def _select_account_preferring_budget_safe(
             routing_costs=routing_costs_by_account_id,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_states,
+            selection_seed=selection_seed,
         )
 
     best_health_states = _best_health_tier_states(state_list)
@@ -2217,6 +2198,7 @@ def _select_account_preferring_budget_safe(
             routing_costs=routing_costs_by_account_id,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_states,
+            selection_seed=selection_seed,
         )
         if burn_first.account is not None:
             return burn_first
@@ -2242,6 +2224,7 @@ def _select_account_preferring_budget_safe(
             routing_costs=routing_costs_by_account_id,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_states,
+            selection_seed=selection_seed,
         )
         if preferred.account is not None:
             return preferred
@@ -2261,6 +2244,7 @@ def _select_account_preferring_budget_safe(
             routing_costs=routing_costs_by_account_id,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_states,
+            selection_seed=selection_seed,
         )
     return select_account(
         state_list,
@@ -2276,6 +2260,7 @@ def _select_account_preferring_budget_safe(
         routing_costs=routing_costs_by_account_id,
         allow_usage_exhaustion_error=allow_usage_exhaustion_error,
         usage_exhaustion_states=usage_exhaustion_states,
+        selection_seed=selection_seed,
     )
 
 

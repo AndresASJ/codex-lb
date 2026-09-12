@@ -3274,7 +3274,9 @@ async def test_isolated_and_excluded_prompt_cache_owner_keeps_its_mapping() -> N
 
     assert selected.account is not None
     assert selected.account.id == alternate.id
-    assert sticky_repo.upserts == []
+    # Kept, not rebound -- and kept *alive*: the row is rewritten onto its own
+    # owner so a 1800 s TTL cannot expire it inside a 1800 s isolation window.
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
     assert sticky_repo.deleted == []
     await balancer.release_account_lease(selected.lease)
 
@@ -3434,7 +3436,9 @@ async def test_isolated_and_capped_prompt_cache_owner_keeps_its_mapping() -> Non
     # Request-local release: the alternate serves the turn and the thread row
     # still points at the isolated owner, so the thread returns home once
     # isolation lifts instead of gaining a permanent new owner.
-    assert sticky_repo.upserts == []
+    # Kept, not rebound -- and kept *alive*: the row is rewritten onto its own
+    # owner so a 1800 s TTL cannot expire it inside a 1800 s isolation window.
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
     for lease in [*saturated_leases, selected.lease]:
         await balancer.release_account_lease(lease)
 

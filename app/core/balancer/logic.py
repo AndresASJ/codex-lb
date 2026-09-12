@@ -483,6 +483,7 @@ def select_account(
     primary_first_usage_weighted: bool = False,
     routing_costs: RoutingCostsByAccount | None = None,
     replica_salt: str | None = None,
+    selection_seed: str | None = None,
     allow_usage_exhaustion_error: bool = True,
     usage_exhaustion_states: Iterable[AccountState] | None = None,
 ) -> SelectionResult:
@@ -536,6 +537,10 @@ def select_account(
             rank by primary-window pressure before secondary-window pressure.
         routing_costs: Optional request-scoped planner costs. Lower cost wins
             after hard eligibility, health tier, and reset-bucket filtering.
+        selection_seed: Optional seed making the pick stable for a given
+            seed value instead of load-proportional. Applied after every
+            eligibility gate, among the accounts the strategy would otherwise
+            draw from.
         replica_salt: Optional per-replica salt mixed into the final
             ``round_robin`` tie-break so peer replicas break exact ties toward
             different accounts. When ``None``, the process-wide salt configured
@@ -753,6 +758,20 @@ def select_account(
     preserve = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_PRESERVE]
     effective_pool = burn_first or normal or preserve or health_pool
     effective_prefer_earlier_reset = prefer_earlier_reset and routing_strategy != "relative_availability"
+
+    if selection_seed is not None:
+        # A caller that needs the *same* answer on every turn -- a conversation
+        # whose owner is temporarily unavailable and must not rotate across its
+        # siblings while it waits -- picks here, inside ``effective_pool``.
+        # Every gate above has already run (availability, quota, cooldown,
+        # error backoff, opportunistic window, recovery probe, health tier,
+        # routing policy), so a seeded pick can only choose among accounts the
+        # strategy itself considers eligible. What it trades away is the
+        # load-proportional draw *within* that pool: the caller is asking for
+        # one account to stay warm for a bounded window, and a pick that moved
+        # with load is exactly what it is trying to avoid.
+        selected = min(effective_pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, selection_seed))
+        return SelectionResult(selected, None)
 
     if routing_strategy == "round_robin":
         selected = min(effective_pool, key=_round_robin_sort_key)

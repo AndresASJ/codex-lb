@@ -11,7 +11,12 @@ import pytest
 
 import app.modules.proxy._service.streaming.helpers as streaming_helpers_module
 from app.core.balancer import ERROR_BACKOFF_THRESHOLD
-from app.core.balancer.logic import AccountState
+from app.core.balancer.logic import (
+    HEALTH_TIER_DRAINING,
+    ROUTING_POLICY_PRESERVE,
+    AccountState,
+    select_account,
+)
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.db.models import Account, AccountStatus, StickySessionKind
@@ -28,8 +33,8 @@ from app.modules.proxy._load_balancer.overload_backoff import (
     SOFT_OVERLOAD_TRIP_WEIGHT,
     UPSTREAM_SOFT_OVERLOAD_CODES,
     OverloadIsolationPolicy,
-    deterministic_isolation_substitute,
     filter_overload_backoff_candidates,
+    isolation_substitute_seed,
     overload_backoff_active,
     overload_backoff_seconds,
     overload_isolation_active,
@@ -748,27 +753,47 @@ def test_sticky_owner_reroute_pool_requires_isolation_and_an_overload_free_sibli
     assert sticky_owner_isolation_reroute_pool(states, isolated, owner_account_id="hot", now=now + 1801.0) is None
 
 
-def test_deterministic_substitute_is_stable_and_order_independent() -> None:
-    pool = [_state("b"), _state("c"), _state("a"), _state("owner")]
-    first = deterministic_isolation_substitute(pool, sticky_key="thread-1", owner_account_id="owner")
-    assert first is not None and first.account_id != "owner"
-    # Same key, same pool, any candidate order -> the same substitute, so two
-    # replicas that observe the same overload-free pool converge without
-    # shared state.
-    shuffled = [_state("owner"), _state("c"), _state("a"), _state("b")]
-    again = deterministic_isolation_substitute(shuffled, sticky_key="thread-1", owner_account_id="owner")
-    assert again is not None and again.account_id == first.account_id
-    # Distinct threads spread over the siblings instead of herding.
-    picks = [
-        deterministic_isolation_substitute(pool, sticky_key=f"thread-{index}", owner_account_id="owner")
-        for index in range(50)
-    ]
-    assert {pick.account_id for pick in picks if pick is not None} == {"a", "b", "c"}
+def test_the_substitute_seed_is_stable_and_owner_scoped() -> None:
+    """The seed stands in for storage the sticky row does not have.
+
+    Two replicas that observe the same overload-free pool must converge on the
+    same sibling for a thread without sharing state, the same thread must get
+    the same answer on every turn, and distinct threads must spread over the
+    siblings instead of herding onto one.
+    """
+
+    first = isolation_substitute_seed(sticky_key="thread-1", owner_account_id="owner")
+    assert first == isolation_substitute_seed(sticky_key="thread-1", owner_account_id="owner")
+    # A thread released under a different owner must not inherit the earlier
+    # substitute: the owner is the other half of the pair being replaced.
+    assert first != isolation_substitute_seed(sticky_key="thread-1", owner_account_id="other-owner")
+    seeds = {isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner") for index in range(50)}
+    assert len(seeds) == 50
 
 
-def test_deterministic_substitute_returns_none_without_a_sibling() -> None:
-    assert deterministic_isolation_substitute([], sticky_key="k", owner_account_id="owner") is None
-    assert deterministic_isolation_substitute([_state("owner")], sticky_key="k", owner_account_id="owner") is None
+def test_a_seeded_pick_stays_inside_the_pool_the_selector_would_draw_from() -> None:
+    """The seed is spent inside the selector, not on a candidate handed to it.
+
+    Every gate the selector applies is pool-relative -- it takes a draining
+    account only when nothing healthier is present, and a ``preserve`` one only
+    when no ``normal`` one is -- so a substitute chosen outside and merely
+    ratified would slip past all of them.
+    """
+
+    draining = _state("draining")
+    draining.health_tier = HEALTH_TIER_DRAINING
+    preserved = _state("preserved")
+    preserved.routing_policy = ROUTING_POLICY_PRESERVE
+    pool = [_state("healthy"), draining, preserved]
+
+    for index in range(24):
+        result = select_account(
+            pool,
+            routing_strategy="usage_weighted",
+            selection_seed=isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner"),
+        )
+        assert result.account is not None
+        assert result.account.account_id == "healthy", result.account.account_id
 
 
 async def _select_sticky_outcome(
@@ -781,6 +806,7 @@ async def _select_sticky_outcome(
     sticky_key: str = "owned-key",
     reallocate_sticky: bool = False,
     secondary_budget_threshold_pct: float = 100.0,
+    preserve_existing_mapping_on_fallback: bool = False,
 ):
     account_map = {state.account_id: cast(Account, AsyncMock()) for state in states}
     return await balancer._select_with_stickiness(
@@ -791,6 +817,7 @@ async def _select_sticky_outcome(
         reallocate_sticky=reallocate_sticky,
         sticky_max_age_seconds=600 if kind == StickySessionKind.PROMPT_CACHE else None,
         secondary_budget_threshold_pct=secondary_budget_threshold_pct,
+        preserve_existing_mapping_on_fallback=preserve_existing_mapping_on_fallback,
         prefer_earlier_reset_accounts=False,
         prefer_earlier_reset_window="secondary",
         routing_strategy="usage_weighted",
@@ -878,6 +905,36 @@ async def test_a_retained_ttl_mapping_is_kept_fresh_rather_than_left_to_expire()
     assert outcome.selection.account is not None
     assert outcome.selection.account.account_id == "clean"
     assert outcome.mutation is not None, "a TTL row must be refreshed, not left to expire"
+    assert outcome.mutation.account_id == "hot", "the refresh must not rebind"
+
+
+@pytest.mark.asyncio
+async def test_a_capped_isolated_owner_is_kept_fresh_even_though_it_never_reached_selection() -> None:
+    """Retention has a second door.
+
+    An owner removed by a cap or by this request's exclusion list never reaches
+    the selection states, so the isolation branch sees no pinned state and the
+    mapping is kept by the fallback-preservation path instead. That path wrote
+    nothing, so on a TTL kind the retained row expired mid-episode -- the
+    default TTL and the default isolation window are both 1800 seconds -- and
+    the next turn persisted the substitute as a brand-new owner.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    outcome = await _select_sticky_outcome(
+        balancer,
+        # "hot" is absent: capped out of the pool before selection ran.
+        [_state("clean"), _state("spare")],
+        _sticky_repo("hot"),
+        preserve_existing_mapping_on_fallback=True,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.selection.account.account_id != "hot"
+    assert outcome.mutation is not None, "the retained row must be refreshed, not left to expire"
     assert outcome.mutation.account_id == "hot", "the refresh must not rebind"
 
 
