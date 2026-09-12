@@ -705,6 +705,23 @@ async def test_record_upstream_overload_logs_isolation_at_the_trip_level(
         get_settings.cache_clear()
 
 
+def _assert_owner_retained(outcome, owner: str) -> None:
+    """The mapping still points at ``owner`` after an isolation reroute.
+
+    Retention is not the same as silence. A TTL-based kind expires on
+    ``updated_at``, and the default affinity TTL and the default isolation
+    window are both 1800 seconds, so suppressing every write would let the
+    retained row die *before* isolation lifts and the next turn would persist
+    the substitute as a brand-new owner. Either no mutation at all (durable
+    kinds) or a same-owner freshness rewrite (TTL kinds) is correct; a delete
+    or a rebind is not.
+    """
+
+    if outcome.mutation is None:
+        return
+    assert outcome.mutation.account_id == owner, outcome.mutation
+
+
 def _isolated_runtime(now: float, *, seconds: float = 1800.0) -> RuntimeState:
     return RuntimeState(
         overload_backoff_until=now + seconds,
@@ -780,6 +797,83 @@ async def _select_sticky_outcome(
     )
 
 
+def _used(account_id: str, used_percent: float) -> AccountState:
+    return AccountState(account_id=account_id, status=AccountStatus.ACTIVE, used_percent=used_percent)
+
+
+@pytest.mark.asyncio
+async def test_substitute_never_crosses_the_budget_threshold() -> None:
+    """The selector's budget filter is pool-relative.
+
+    ``_select_account_preferring_budget_safe`` accepts an over-budget account
+    only when no safe one is visible, so validating a deterministic preference
+    on the candidate *alone* hid that filter: a thread could be pinned to an
+    85%-used sibling while a 20%-used one sat in the same pool.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+    states = [_used("hot", 0.0), _used("safe", 20.0), _used("pressured", 85.0)]
+
+    for _ in range(12):
+        outcome = await _select_sticky_outcome(balancer, states, _sticky_repo("hot"))
+        assert outcome.selection.account is not None
+        assert outcome.selection.account.account_id == "safe", outcome.selection.account.account_id
+
+
+@pytest.mark.asyncio
+async def test_a_retained_ttl_mapping_is_kept_fresh_rather_than_left_to_expire() -> None:
+    """Retention must not mean silence.
+
+    A TTL kind expires on ``updated_at``. The default affinity TTL and the
+    default isolation window are both 1800 s, so suppressing every write would
+    let the retained row die before isolation lifts and the next turn would
+    persist the substitute as a brand-new owner -- the accumulation this change
+    removes, arriving through the back door.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("hot"), _state("clean")],
+        _sticky_repo("hot"),
+        kind=StickySessionKind.PROMPT_CACHE,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.selection.account.account_id == "clean"
+    assert outcome.mutation is not None, "a TTL row must be refreshed, not left to expire"
+    assert outcome.mutation.account_id == "hot", "the refresh must not rebind"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_reallocation_still_retires_an_isolated_owner() -> None:
+    """``reallocate_sticky`` is an instruction to retire the mapping.
+
+    It outranks retention, exactly as it already does on the TTL-bounded
+    branch.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("hot"), _state("clean")],
+        _sticky_repo("hot"),
+        reallocate_sticky=True,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.mutation is not None
+    assert outcome.mutation.account_id != "hot", "reallocation must not be swallowed by retention"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "kind",
@@ -799,7 +893,7 @@ async def test_isolated_soft_sticky_owner_is_served_by_a_substitute_without_rebi
     assert outcome.selection.account is not None
     assert outcome.selection.account.account_id == "clean"
     # No delete and no rebind: the mapping survives the isolation episode.
-    assert outcome.mutation is None
+    _assert_owner_retained(outcome, "hot")
     assert outcome.effective_states is not None
     assert [state.account_id for state in outcome.effective_states] == ["clean"]
 
@@ -823,7 +917,7 @@ async def test_isolated_soft_sticky_owner_keeps_one_substitute_across_turns(kind
     for _ in range(24):
         outcome = await _select_sticky_outcome(balancer, states, _sticky_repo("hot"), kind=kind)
         assert outcome.selection.account is not None
-        assert outcome.mutation is None
+        _assert_owner_retained(outcome, "hot")
         chosen.add(outcome.selection.account.account_id)
     assert len(chosen) == 1, chosen
     assert "hot" not in chosen
@@ -1145,7 +1239,7 @@ async def test_request_local_isolation_release_is_logged_as_retained(
     caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
     outcome = await _select_sticky_outcome(balancer, [_state("hot"), _state("clean")], _sticky_repo("hot"))
 
-    assert outcome.mutation is None
+    _assert_owner_retained(outcome, "hot")
     messages = [record.getMessage() for record in caplog.records]
     retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
     assert retained, messages
@@ -1193,7 +1287,7 @@ async def test_budget_pressured_isolated_owner_is_released_with_the_secondary_bu
     assert outcome.selection.account is not None
     assert outcome.selection.account.account_id == "safe"
     # Request-local: the filter picks the substitute, not a new persisted owner.
-    assert outcome.mutation is None
+    _assert_owner_retained(outcome, "owner")
 
 
 # --- burst cooldown (code-less upstream HTTP 429) ----------------------------

@@ -362,6 +362,35 @@ def sticky_owner_isolation_reroute_pool(
     return pool
 
 
+def budget_peer_pool(
+    pool: list[AccountState],
+    reference: AccountState,
+    *,
+    budget_threshold_pct: float,
+) -> list[AccountState]:
+    """The pool members no worse than ``reference`` on the budget-safe axis.
+
+    ``_select_account_preferring_budget_safe`` is *pool-relative*: it accepts an
+    over-budget account when no budget-safe alternative is visible. Running the
+    selector on a single candidate therefore hides that filter and would let a
+    deterministic preference pin a thread to an 85%-used sibling while a
+    20%-used one sat in the same pool.
+
+    Restricting the hash to the reference's own tier keeps the filter intact
+    while preserving the spread the hash exists for: a preference among equally
+    safe siblings is exactly what it should express, and a preference that
+    crosses the threshold is exactly what it should not.
+    """
+
+    def _safe(state: AccountState) -> bool:
+        used = state.used_percent
+        return used is None or used <= budget_threshold_pct
+
+    if not _safe(reference):
+        return list(pool)
+    return [state for state in pool if _safe(state)] or list(pool)
+
+
 def deterministic_isolation_substitute(
     pool: list[AccountState],
     *,

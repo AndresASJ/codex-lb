@@ -29,6 +29,7 @@ from app.db.models import Account, AccountStatus, AdditionalUsageHistory, Sticky
 from app.db.snapshot import clone_row
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.proxy._load_balancer.overload_backoff import (
+    budget_peer_pool,
     deterministic_isolation_substitute,
     filter_overload_backoff_candidates,
     overload_backoff_active,
@@ -702,6 +703,18 @@ async def run_sticky_selection_path(
                 and (
                     (
                         cap_spillover_allowed
+                        # An explicit reallocation is an instruction to retire
+                        # the mapping, and it outranks cap spillover exactly as
+                        # it already does on the TTL-bounded branch below.
+                        # Without this the owner is absent from
+                        # ``selection_states``, so the later
+                        # ``caller_requested_reallocation`` guard is never
+                        # reached and the row survives a reallocation that used
+                        # to rebind it. ``require_unambiguous_account`` is not
+                        # gated: that arm is a correctness requirement about an
+                        # ambiguous conversation owner, not a locality
+                        # preference, so a caller cannot waive it.
+                        and not reallocate_sticky
                         and any(state.account_id == sticky_existing_account_id for state in states)
                         and not any(state.account_id == sticky_existing_account_id for state in selection_states)
                     )
@@ -1617,19 +1630,38 @@ async def _select_with_stickiness(
                 # strategy, health, quota and budget gates the pool pick
                 # would, so an ineligible substitute simply falls back to the
                 # pool and the pool can never be emptied by this preference.
-                candidate: SelectionResult | None = None
-                substitute = deterministic_isolation_substitute(
-                    overload_reroute_pool,
-                    sticky_key=sticky_key,
-                    owner_account_id=pinned.account_id,
-                )
-                if substitute is not None:
-                    substitute_result = _choose_from([substitute])
-                    if substitute_result.account is not None:
-                        candidate = substitute_result
-                substitute_is_stable = candidate is not None
-                if candidate is None:
-                    candidate = _choose_from(overload_reroute_pool)
+                # The pool pick first: it is what the selector considers best
+                # over the *whole* pool, and several of its gates are
+                # pool-relative -- ``_select_account_preferring_budget_safe``
+                # accepts an over-budget account when no safe alternative is
+                # visible, and a draining one when nothing else is. Running
+                # the selector on the substitute alone would therefore hide
+                # exactly those filters and could pin the thread to an
+                # 85%-used sibling while a 20%-used one sat in the pool.
+                candidate = _choose_from(overload_reroute_pool)
+                substitute_is_stable = False
+                if candidate.account is not None:
+                    # Hash over the pool pick's own budget tier, not the raw
+                    # pool. The selector's budget filter is pool-relative --
+                    # it accepts an over-budget account only when no safe one
+                    # is visible -- so hashing over everything and validating
+                    # the winner alone would hide that filter entirely. Scoping
+                    # the hash keeps the spread (a preference among equally
+                    # safe siblings) while making the threshold uncrossable.
+                    substitute = deterministic_isolation_substitute(
+                        budget_peer_pool(
+                            overload_reroute_pool,
+                            candidate.account,
+                            budget_threshold_pct=budget_threshold_pct,
+                        ),
+                        sticky_key=sticky_key,
+                        owner_account_id=pinned.account_id,
+                    )
+                    if substitute is not None:
+                        substitute_result = _choose_from([substitute])
+                        if substitute_result.account is not None:
+                            candidate = substitute_result
+                            substitute_is_stable = True
                 if candidate.account is not None and candidate.account.account_id != pinned.account_id:
                     overload_reroute = candidate
                     overload_reroute_request_local = not caller_requested_reallocation
@@ -1767,6 +1799,20 @@ async def _select_with_stickiness(
                 # availability because the turn is already being served by
                 # the substitute.
                 persist_fallback = False
+                # Preserving must not mean going silent. A TTL-based kind
+                # (PROMPT_CACHE) expires on ``updated_at``, and the default
+                # affinity TTL and the default isolation window are both 1800
+                # seconds -- so suppressing every write would let the retained
+                # row die *before* isolation lifts, and the next turn would
+                # persist the substitute as a brand-new owner. That is the
+                # accumulation this change exists to remove, arriving through
+                # the back door. Rewrite the same owner instead: the row stays
+                # on the warm account and its freshness tracks the thread.
+                if sticky_max_age_seconds is not None:
+                    pending_mutation = _StickyMutation(
+                        account_id=pinned.account_id,
+                        refresh_skip_deadline=sticky_refresh_skip_deadline,
+                    )
             elif reallocate_sticky:
                 pending_mutation = _StickyMutation(account_id=None)
             elif pinned.status not in _RECOVERABLE_STATUSES:
@@ -1804,6 +1850,34 @@ async def _select_with_stickiness(
         if chosen.account is None and fallback_candidates is not states:
             fallback_candidates = states
             chosen = _choose_from(states)
+        # When the mapping is being *kept* while its owner sits out this turn
+        # -- cap-filtered or excluded by this request's retry loop, so it never
+        # reached ``selection_states`` and the isolation branch above could not
+        # see a ``pinned`` state -- the substitute is re-picked on every turn
+        # just as it is there. An ordinary pool pick would rotate the thread
+        # across the siblings under round-robin, which is more churn than the
+        # single rebind this change replaces. Give those paths the same stable
+        # substitute, head-to-head against the pool pick so every pool-relative
+        # gate still applies.
+        if (
+            preserve_existing_mapping_on_fallback
+            and isinstance(existing, str)
+            and chosen.account is not None
+            and chosen.account.account_id != existing
+        ):
+            stable = deterministic_isolation_substitute(
+                budget_peer_pool(
+                    fallback_candidates,
+                    chosen.account,
+                    budget_threshold_pct=budget_threshold_pct,
+                ),
+                sticky_key=sticky_key,
+                owner_account_id=existing,
+            )
+            if stable is not None and stable.account_id != chosen.account.account_id:
+                stable_result = _choose_from([stable])
+                if stable_result.account is not None:
+                    chosen = stable_result
     chosen_pool = fallback_candidates if fallback_candidates is not states else None
     if persist_fallback and chosen.account is not None and chosen.account.account_id in account_map:
         return finish_selection(chosen, persist_account_id=chosen.account.account_id, effective_states=chosen_pool)
