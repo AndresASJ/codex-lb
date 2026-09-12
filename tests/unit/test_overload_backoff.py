@@ -15,6 +15,7 @@ from app.core.balancer.logic import (
     HEALTH_TIER_DRAINING,
     ROUTING_POLICY_PRESERVE,
     AccountState,
+    RoutingCost,
     select_account,
 )
 from app.core.config.settings import get_settings
@@ -906,6 +907,47 @@ async def test_a_retained_ttl_mapping_is_kept_fresh_rather_than_left_to_expire()
     assert outcome.selection.account.account_id == "clean"
     assert outcome.mutation is not None, "a TTL row must be refreshed, not left to expire"
     assert outcome.mutation.account_id == "hot", "the refresh must not rebind"
+
+
+def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
+    """The seed replaces the draw, not the strategy.
+
+    ``capacity_weighted`` and ``relative_availability`` narrow to the lowest
+    planner cost before drawing, and ``prefer_earlier_reset`` narrows to the
+    soonest reset bucket. A seed spent before those filters would reroute a
+    thread onto an account the strategy had already put out of reach.
+    """
+
+    now = 2_000_000_000.0
+    cheap, expensive = _state("cheap"), _state("expensive")
+    costs = {"cheap": RoutingCost(total=1.0), "expensive": RoutingCost(total=99.0)}
+
+    soon, later = _state("soon"), _state("later")
+    soon.secondary_reset_at = int(now + 3600.0)
+    later.secondary_reset_at = int(now + 30 * 86400.0)
+
+    for index in range(24):
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        for strategy in ("capacity_weighted", "relative_availability"):
+            by_cost = select_account(
+                [cheap, expensive],
+                now,
+                routing_strategy=strategy,
+                routing_costs=costs,
+                selection_seed=seed,
+            )
+            assert by_cost.account is not None
+            assert by_cost.account.account_id == "cheap", f"{strategy} took the higher planner cost"
+
+        by_reset = select_account(
+            [soon, later],
+            now,
+            routing_strategy="capacity_weighted",
+            prefer_earlier_reset=True,
+            selection_seed=seed,
+        )
+        assert by_reset.account is not None
+        assert by_reset.account.account_id == "soon", "the later reset bucket was taken"
 
 
 @pytest.mark.asyncio

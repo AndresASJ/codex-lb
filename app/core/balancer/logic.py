@@ -538,9 +538,11 @@ def select_account(
         routing_costs: Optional request-scoped planner costs. Lower cost wins
             after hard eligibility, health tier, and reset-bucket filtering.
         selection_seed: Optional seed making the pick stable for a given
-            seed value instead of load-proportional. Applied after every
-            eligibility gate, among the accounts the strategy would otherwise
-            draw from.
+            seed value instead of load-proportional. Applied to the pool the
+            configured strategy has already narrowed to, so it decides only
+            which of the accounts the strategy was about to draw from is
+            taken. Drain strategies (``sequential_drain``, ``reset_drain``,
+            ``single_account``) have one correct answer and ignore it.
         replica_salt: Optional per-replica salt mixed into the final
             ``round_robin`` tie-break so peer replicas break exact ties toward
             different accounts. When ``None``, the process-wide salt configured
@@ -718,6 +720,16 @@ def select_account(
         secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
         return _planner_cost(state, routing_costs), secondary_used, primary_used, last_selected, account_id
 
+    def _seeded_pick(pool: list[AccountState], seed: str) -> AccountState:
+        """The strategy's draw, replaced by a stable per-seed choice.
+
+        Applied to the pool the strategy has already narrowed to -- its planner
+        cost and reset-preference filters run first -- so the seed decides only
+        *which* of the accounts the strategy was about to draw from is taken,
+        never whether an account it excluded becomes eligible.
+        """
+        return min(pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, seed))
+
     round_robin_salt = _effective_replica_salt(replica_salt)
 
     def _round_robin_sort_key(state: AccountState) -> tuple[float, float, str]:
@@ -759,22 +771,12 @@ def select_account(
     effective_pool = burn_first or normal or preserve or health_pool
     effective_prefer_earlier_reset = prefer_earlier_reset and routing_strategy != "relative_availability"
 
-    if selection_seed is not None:
-        # A caller that needs the *same* answer on every turn -- a conversation
-        # whose owner is temporarily unavailable and must not rotate across its
-        # siblings while it waits -- picks here, inside ``effective_pool``.
-        # Every gate above has already run (availability, quota, cooldown,
-        # error backoff, opportunistic window, recovery probe, health tier,
-        # routing policy), so a seeded pick can only choose among accounts the
-        # strategy itself considers eligible. What it trades away is the
-        # load-proportional draw *within* that pool: the caller is asking for
-        # one account to stay warm for a bounded window, and a pick that moved
-        # with load is exactly what it is trying to avoid.
-        selected = min(effective_pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, selection_seed))
-        return SelectionResult(selected, None)
-
     if routing_strategy == "round_robin":
-        selected = min(effective_pool, key=_round_robin_sort_key)
+        selected = (
+            _seeded_pick(effective_pool, selection_seed)
+            if selection_seed is not None
+            else min(effective_pool, key=_round_robin_sort_key)
+        )
     elif routing_strategy == "capacity_weighted":
         candidate_pool = (
             _prefer_earlier_reset_candidates(effective_pool, current, prefer_earlier_reset_window)
@@ -785,7 +787,11 @@ def select_account(
             selected = min(candidate_pool, key=lambda state: _capacity_probe_sort_key_with_cost(state, routing_costs))
         else:
             candidate_pool = _lowest_planner_cost_candidates(candidate_pool, routing_costs)
-            selected = _select_capacity_weighted(candidate_pool)
+            selected = (
+                _seeded_pick(candidate_pool, selection_seed)
+                if selection_seed is not None
+                else _select_capacity_weighted(candidate_pool)
+            )
     elif routing_strategy == "relative_availability":
         candidate_pool = _lowest_planner_cost_candidates(effective_pool, routing_costs)
         selected = _select_relative_availability(
@@ -794,6 +800,7 @@ def select_account(
             power=relative_availability_power,
             top_k=relative_availability_top_k,
             deterministic_probe=deterministic_probe,
+            selection_seed=selection_seed,
         )
     elif routing_strategy == "fill_first":
         candidate_pool = (
@@ -801,12 +808,18 @@ def select_account(
             if prefer_earlier_reset
             else effective_pool
         )
-        selected = _select_fill_first(candidate_pool)
+        selected = (
+            _seeded_pick(candidate_pool, selection_seed)
+            if selection_seed is not None
+            else _select_fill_first(candidate_pool)
+        )
     else:
         effective_usage_weighted_order: UsageWeightedOrder = (
             "primary_first" if primary_first_usage_weighted else usage_weighted_order
         )
-        if effective_usage_weighted_order == "primary_first":
+        if selection_seed is not None:
+            selected = _seeded_pick(effective_pool, selection_seed)
+        elif effective_usage_weighted_order == "primary_first":
             selected = min(
                 effective_pool,
                 key=(
@@ -1010,6 +1023,7 @@ def _select_relative_availability(
     power: float,
     top_k: int,
     deterministic_probe: bool,
+    selection_seed: str | None = None,
 ) -> AccountState:
     weighted_candidates = _relative_availability_weighted_candidates(
         available,
@@ -1044,7 +1058,13 @@ def _select_relative_availability(
             raw_score=_relative_availability_raw_score(winner, current),
         )
         return winner
-    winner = random.choices(states, weights=weights, k=1)[0]
+    winner = (
+        # Inside the top-k the draw has already been narrowed by availability;
+        # the seed only makes the pick stable for its caller.
+        min(states, key=lambda state: _decorrelated_tie_breaker(state.account_id, selection_seed))
+        if selection_seed is not None
+        else random.choices(states, weights=weights, k=1)[0]
+    )
     for state, weight, raw_score in weighted_candidates:
         if state.account_id == winner.account_id:
             _log_relative_availability_winner(winner, current=current, weight=weight, raw_score=raw_score)
