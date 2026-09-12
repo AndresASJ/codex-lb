@@ -1007,6 +1007,43 @@ def test_a_seeded_pick_trades_weight_magnitude_for_not_moving() -> None:
     assert unseeded.count("large") / len(unseeded) > 0.9, unseeded.count("large") / len(unseeded)
 
 
+def test_a_seeded_pick_does_not_follow_a_reshuffled_ranking() -> None:
+    """Rank cuts move for reasons that are not about the thread.
+
+    ``relative_availability`` admits its top ``k`` by live availability, so a
+    sibling can stay well within reach and still drop out of that slice the
+    moment another account's usage refreshes. A retained thread following that
+    reordering would leave a substitute that never became ineligible.
+    """
+
+    now = 2_000_000_000.0
+    pool = []
+    for index in range(10):
+        state = _state(f"sibling-{index}")
+        state.capacity_credits = 1000.0
+        state.secondary_used_percent = 10.0
+        pool.append(state)
+
+    flipped = []
+    for index in range(100):
+        for state in pool:
+            state.secondary_used_percent = 10.0
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        first = select_account(pool, now, routing_strategy="relative_availability", selection_seed=seed)
+        assert first.account is not None
+        # Every *other* account refreshes to a better position, reshuffling the
+        # ranking without the substitute becoming ineligible.
+        for state in pool:
+            if state.account_id != first.account.account_id:
+                state.secondary_used_percent = 2.0
+        second = select_account(pool, now, routing_strategy="relative_availability", selection_seed=seed)
+        assert second.account is not None
+        if second.account.account_id != first.account.account_id:
+            flipped.append((first.account.account_id, second.account.account_id))
+
+    assert not flipped, f"{len(flipped)}/100 threads followed the reshuffle: {flipped[:5]}"
+
+
 def test_a_seeded_pick_still_spreads_threads_over_an_equally_scored_pool() -> None:
     """Stability per thread must not become herding across threads.
 

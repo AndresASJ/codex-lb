@@ -1018,7 +1018,15 @@ def _relative_availability_weighted_candidates(
             ),
         )
     )
-    safe_top_k = max(1, top_k)
+    # A seeded caller takes every candidate above the minimum weight fraction,
+    # not the top ``k``. The slice is a *rank* cut over live availability, so a
+    # sibling can stay well within reach and still drop out of it the moment
+    # another account's usage refreshes -- and a retained thread would follow
+    # that reordering off its substitute. The fraction floor is the eligibility
+    # bound that survives here: it moves only when an account genuinely falls
+    # away from the best, which is a change in the pool rather than a
+    # reshuffle of it.
+    safe_top_k = len(weighted) if selection_seed is not None else max(1, top_k)
     top_candidates = weighted[:safe_top_k]
     _log_relative_availability_top_k(top_candidates, current=current)
     return top_candidates
