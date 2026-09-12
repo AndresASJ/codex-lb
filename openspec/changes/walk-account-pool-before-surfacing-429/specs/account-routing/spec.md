@@ -4,15 +4,15 @@
 
 ### Requirement: A single account's rejection is not the pool's rejection
 
-When a pre-visible upstream failure classified `rate_limit`, `quota`, or `retryable_transient` occurs on a request that is not owner-bound, the proxy MUST exclude the rejecting account for the remainder of that request and reselect from the accounts that remain, and MUST repeat this until either a selected account serves the request or no non-excluded candidate remains. The proxy MUST NOT bound this walk by a fixed attempt count unrelated to the size of the usable pool.
+When a pre-visible upstream failure reports `excludes_account = true` on a request that is not owner-bound, the proxy MUST exclude the rejecting account for the remainder of that request and reselect from the accounts that remain, and MUST repeat this until either a selected account serves the request or no non-excluded candidate remains. `excludes_account` is the classifier's account-selection predicate: a model-capacity rejection on a walkable class is false, while quota, rate-limit, usage-limit, and burst-rejection failures that selection may move away from are true. The proxy MUST NOT bound this walk by a fixed attempt count unrelated to the size of the usable pool.
 
-The walk MUST terminate. Termination MUST be guaranteed by three independent bounds: the request budget deadline that already clamps every attempt; a runaway ceiling on the number of account attempts in one request, which MUST exceed the largest pool the deployment supports so that it can never become the ordinary bound; and a monotone-progress invariant requiring every `failover_next` outcome to grow the request-scoped excluded-account set. When a `failover_next` outcome does not grow that set, the proxy MUST log a warning naming the request and MUST terminate the walk rather than reselect.
+The walk MUST terminate. Termination MUST be guaranteed by three independent bounds: the request budget deadline that already clamps every attempt; a runaway ceiling derived from the current candidate count, so it scales with any valid pool size and cannot become the ordinary bound; and a monotone-progress invariant requiring every `failover_next` outcome to grow the request-scoped excluded-account set. When a `failover_next` outcome does not grow that set, the proxy MUST log a warning naming the request and MUST terminate the walk rather than reselect.
 
 The monotone-progress invariant governs failover outcomes only. An account-capacity recovery that deliberately re-admits a previously excluded account — waiting for a local cap to clear rather than rejecting the account — MUST be allowed to remove its own exclusion, MUST NOT be reported as a progress failure, and MUST remain bounded by the request budget. A walk that could re-admit an account on failover evidence would not terminate; a walk that could not re-admit on capacity evidence would lose a recovery path that exists today.
 
 The proxy MUST record account health exactly once per attempted account per request. A walk across N accounts MUST produce N health writes, not N writes per attempt.
 
-Owner-bound requests are outside this requirement: a request that cannot move to another account MUST continue to take the bounded same-account path and surface its original rejection unchanged.
+Owner-bound requests are outside the relocation part of this requirement: a request that cannot move to another account MUST continue to return through the `owner_bound` branch and MUST NOT walk the pool. Burst rejections may still use the bounded same-account retry path. Usage-limit messages, including code-less and `invalid_request_error` envelopes, still use the new classification and same-account-backoff skip before their original rejection is surfaced.
 
 When a walk ends without a served response, the proxy MUST record which bound ended it — a non-retryable failure, an exhausted pool, the request deadline, the runaway ceiling, or a progress failure. Those outcomes are operationally different and MUST be distinguishable after the fact; collapsing them into one undifferentiated "surface" leaves an operator unable to tell a bad request from an exhausted fleet.
 
@@ -48,7 +48,8 @@ When a walk ends without a served response, the proxy MUST record which bound en
 - **GIVEN** a request bound to account A by a required previous-response owner, a file pin, turn-state ownership, or the `single_account` routing strategy
 - **WHEN** account A returns a pre-visible failure
 - **THEN** the proxy does not walk the pool
-- **AND** the request takes the bounded same-account retry path and then surfaces account A's failure unchanged
+- **AND** burst rejections keep the bounded same-account retry path
+- **AND** other classes follow their owner-bound classification and terminal-rendering rules without relocating to another account
 
 ### Requirement: A walk proves exhaustion from its own attempts
 
@@ -83,7 +84,7 @@ The walk therefore MUST carry its own per-account evidence to the terminal decis
 
 When an account walk ends without a served response, the client-visible failure MUST be decided from the bound that ended the walk, and MUST NOT be the first, the last, or an arbitrary per-account rejection chosen without that decision.
 
-Two bounds answer without consulting the probe, because the pool's state is not what ended the walk: a `non_retryable` failure surfaces as itself, and an exhausted request budget yields `upstream_request_timeout` as "Streaming Responses requests use a bounded retry budget" requires. For every other bound the proxy MUST consult the pool-exhaustion probe at most once per request, using the same eligibility filtering ordinary selection applies, and MUST combine that answer with the walk's own evidence as required by "A walk proves exhaustion from its own attempts".
+Two bounds answer without consulting the probe, because the pool's state is not what ended the walk: a `non_retryable` failure surfaces as itself, and an exhausted request budget yields `upstream_request_timeout` as "Streaming Responses requests use a bounded retry budget" requires. For every other bound the proxy MUST consult the pool-exhaustion probe at most once per request, using the same eligibility and security-scope filtering ordinary selection applies, and MUST combine that answer with the walk's own evidence as required by "A walk proves exhaustion from its own attempts".
 
 When the probe reports pool-wide usage exhaustion, the proxy MUST render the canonical usage-limit rejection defined by "Pool usage exhaustion is reported as a usage-limit error", including `error.resets_at` when an authoritative reset timestamp is available.
 
@@ -105,11 +106,11 @@ A client that receives the canonical pool rejection MUST NOT be left without ret
 - **WHEN** the walk ends
 - **THEN** the client receives the last attempted account's failure with its status, code and body unchanged
 
-#### Scenario: Drain strategies keep today's response
+#### Scenario: Drain strategies preserve their per-account terminal response
 
 - **GIVEN** the configured routing strategy is a drain strategy, for which the probe declines to answer
 - **WHEN** the walk ends
-- **THEN** the client receives the preserved per-account failure exactly as it does today
+- **THEN** the client receives the preserved per-account failure selected by the drain walk's bound, without replacing it with a canonical pool-exhaustion response
 
 ## MODIFIED Requirements
 

@@ -39,7 +39,7 @@ A rejection that benches the account is the opposite case and MUST still exclude
 
 The account-health write, the persisted status, the reset deadline and the model-capacity replay wait are unchanged by this requirement: it governs account selection only.
 
-The exclusion answer the classifier reports MUST be the selection predicate, not an exhaustion predicate. It is true for every pre-visible failure the walk may move away from — `rate_limit`, `quota` and `retryable_transient` alike, which includes the code-less burst 429 that "An unbound burst rejection walks instead of surfacing" requires to be excluded — and false only when the rejection is a model-capacity one. A field that answers "was this account exhaustion" instead collapses the burst rejection and the capacity rejection to the same value and cannot drive the walk. A message that asserts the usage limit MUST take precedence over a model-capacity match when both appear in one envelope, because the usage limit is account-scoped.
+The exclusion answer the classifier reports MUST be the selection predicate, not an exhaustion predicate. It is true for every pre-visible failure the walk may move away from — `rate_limit`, `quota` and `retryable_transient` alike, which includes the code-less burst 429 that "An unbound burst rejection walks instead of surfacing" requires to be excluded — and false only when the rejection is a model-capacity one on a class whose health write leaves the account selectable. A field that answers "was this account exhaustion" instead collapses the burst rejection and the capacity rejection to the same value and cannot drive the walk. A message that asserts the usage limit MUST take precedence over a model-capacity match when both appear in one envelope, because the usage limit is account-scoped.
 
 #### Scenario: Capacity on a walkable class does not rotate the pool
 
@@ -65,7 +65,7 @@ The exclusion answer the classifier reports MUST be the selection predicate, not
 
 When a streaming `/v1/responses` request encounters upstream instability, the proxy MUST enforce a configurable total request budget across selection, token refresh, account-capacity recovery waits, and upstream stream attempts. Each upstream stream attempt MUST clamp its connect timeout, idle timeout, and total request timeout to the remaining request budget.
 
-The number of accounts a request may attempt MUST NOT be a fixed per-transport constant. It MUST be bounded by the remaining request budget, by a fixed runaway ceiling on account attempts within one request, and by the monotone growth of the request-scoped excluded-account set, as required by "A single account's rejection is not the pool's rejection". The runaway ceiling MUST NOT be an operator setting.
+The number of accounts a request may attempt MUST NOT be a fixed per-transport constant. It MUST be bounded by the remaining request budget, by a runaway ceiling derived from the current candidate count, and by the monotone growth of the request-scoped excluded-account set, as required by "A single account's rejection is not the pool's rejection". The runaway ceiling MUST NOT be an operator setting.
 
 #### Scenario: Remaining budget constrains all stream attempt timeouts
 - **WHEN** account selection, account-capacity recovery, or token refresh leaves only part of the request budget available before a stream attempt starts

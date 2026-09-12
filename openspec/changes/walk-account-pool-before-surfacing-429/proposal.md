@@ -47,31 +47,33 @@ is exhausted.
   code — no existing classification is inverted — and additionally reports
   whether the walk may move off this account. Account selection reads that
   answer; account health keeps reading `failure_class`. It is true for every
-  walkable class and false only for a model-capacity rejection, even under a
-  rate-limit code. A usage-limit message additionally raises the class from
-  `retryable_transient` to `rate_limit`, but only for the two codes that carry
-  no classification decision of their own. No second classifier is introduced.
+  walkable class and false only for a model-capacity rejection whose health
+  write leaves the account selectable; a rate-limit or quota code still benches
+  and excludes the account. A usage-limit message additionally raises the class
+  from `retryable_transient` to `rate_limit`, but only for the two codes that
+  carry no classification decision of their own. No second classifier is
+  introduced.
 - **The walk is bounded by the pool, not by a constant.**
   `failover_decision` takes `more_candidates_possible: bool` instead of
   `candidates_remaining: int`, and the `non_retryable` check moves ahead of the
   budget check so the decision log distinguishes "the request was bad" from
   "we ran out of accounts". The three per-transport attempt constants are
   deleted. Termination is proved by three independent bounds: the existing
-  request deadline, a `MAX_ACCOUNT_ATTEMPTS_CEILING` runaway fence, and a
+  request deadline, a candidate-count-derived runaway fence, and a
   monotone-progress invariant — a `failover_next` that does not grow
   `excluded_account_ids` logs `pool_walk_no_progress` and terminates.
 - **The client-visible failure is decided at the end of the walk**, by a new
   single-purpose `app/modules/proxy/pool_terminal.py` that asks
-  `probe_pool_usage_exhaustion` exactly once. Exhausted pool -> the canonical
-  `usage_limit_reached` 429 with `error.resets_at`. Any other answer, including
-  the drain-strategy decline -> the preserved last per-account failure,
-  verbatim. Drain strategies and `single_account` therefore keep byte-identical
-  behaviour.
-- **Owner-bound requests are untouched by this change.** They return at the
-  `owner_bound` branch of `failover_decision` before the walk is reached, so
-  the burst-429 same-account backoff and its surfaced rejection are unchanged.
-  Making anchored requests movable is a separate concern and a separate change
-  (`relocate-anchored-turns-across-accounts`).
+  `probe_pool_usage_exhaustion` at most once, except for non-retryable and
+  exhausted-budget exits, whose prescribed responses bypass the probe.
+  Exhausted pool -> the canonical `usage_limit_reached` 429 with
+  `error.resets_at`. Any other eligible answer, including the drain-strategy
+  decline -> the preserved last per-account failure, verbatim.
+- **Owner-bound requests stay non-relocatable.** They return at the
+  `owner_bound` branch of `failover_decision` before the walk is reached.
+  Burst 429s keep the bounded same-account backoff; code-less or
+  `invalid_request_error` usage-limit messages still change classification and
+  skip same-account backoff before surfacing on the owner.
 - Exactly one account-health write per attempted account per request.
 
 ## Impact
@@ -82,12 +84,13 @@ is exhausted.
   rather than the literal `usage_limit_reached` code, without widening to
   throttling or quota codes).
 - **Clients** that today receive one account's 429 while other accounts are
-  usable now receive a served response. A client that receives a 429 now
-  receives it because the pool is exhausted, and it carries `error.resets_at`.
-- **Operators**: no new setting. `MAX_ACCOUNT_ATTEMPTS_CEILING` is a module
-  constant beside `BURST_SAME_ACCOUNT_MAX_RETRIES`, following the precedent
-  those constants set ("the Settings ratchet is full and this is a transport
-  invariant, not an operator knob"). The `[settings_fields]` ratchet does not move.
+  usable now receive a served response. An unbound request receives the
+  canonical exhausted-pool 429 with `error.resets_at` only when the
+  pool-exhaustion probe or the walk's own exhaustion evidence confirms
+  exhaustion. Other terminal paths preserve their existing failure contract.
+- **Operators**: no new setting. The runaway fence is derived from the current
+  candidate count, not from a fixed operator knob. The `[settings_fields]`
+  ratchet does not move.
 - **Upstream load**: a request that previously stopped at three accounts may
   now attempt more. It is bounded by the same request deadline as before, and
   each attempt is a request that would otherwise have been a client-visible

@@ -49,13 +49,10 @@
   a retry hint when no `error.resets_at` is available.
 - [ ] `app/core/balancer/logic.py`: replace `candidates_remaining: int` with
   `more_candidates_possible: bool` in `failover_decision`; move the
-  `non_retryable` check ahead of the candidate check; add
-  `MAX_ACCOUNT_ATTEMPTS_CEILING` beside `BURST_SAME_ACCOUNT_MAX_RETRIES` with
-  the same "not an operator knob" comment. Its value MUST exceed the largest
-  supported pool — this fleet runs 28 accounts, so a ceiling of 16 would silently
-  become the ordinary bound and re-introduce exactly the fixed cap this change
-  removes. Keep `candidates_remaining` as a deprecated keyword shim for one
-  release.
+  `non_retryable` check ahead of the candidate check; derive the runaway
+  account-attempt fence from the current candidate count instead of a fixed
+  pool-size guess. Keep `candidates_remaining` as a deprecated keyword shim for
+  one release.
 - [ ] Record which bound ended a walk (non-retryable, exhausted pool, deadline,
   ceiling, progress failure). `failover_decision` returning `surface` for all of
   them is what makes the reorder unobservable today.
@@ -93,8 +90,8 @@
   serves the client with three dispatches and three health writes; all accounts
   exhausted yields one `usage_limit_reached` 429 with `error.resets_at` and one
   probe call; a `non_retryable` failure mid-walk surfaces immediately; an
-  owner-bound burst 429 never walks; a drain strategy is byte-identical to
-  today; a selector that returns an excluded account triggers
+  owner-bound burst 429 never walks; a drain strategy preserves the bounded
+  drain walk's per-account failure; a selector that returns an excluded account triggers
   `pool_walk_no_progress`.
 - [ ] `tests/unit/test_streaming_retry_virtual_time.py`: the walk adds no wall
   time between attempts and deadline exhaustion mid-walk terminates with
@@ -102,8 +99,9 @@
 - [ ] `tests/integration/test_exhaustion_probe_integration.py`: the probe is
   invoked at most once per request from the terminal path.
 - [ ] `tests/simulation/test_proxy_turn_lifecycle_property.py`: for any sequence
-  of per-account failures, dispatches are bounded, the excluded set is strictly
-  monotone, and there is exactly one health write per attempted account.
+  of failover exclusions, dispatches are bounded, the excluded set is strictly
+  monotone, and there is exactly one health write per attempted account. Cover
+  capacity recovery separately as the allowed re-admission exception.
 - [ ] Confirm the `[settings_fields]` ratchet does not move and no new
   `CODEX_LB_*` name is introduced.
 - [ ] `openspec validate --specs`, `uv run ruff check`,

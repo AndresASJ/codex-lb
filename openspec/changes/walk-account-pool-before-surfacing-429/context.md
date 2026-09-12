@@ -8,8 +8,9 @@ ceiling. The invariant the retry loop already maintains is enough: the
 request-scoped excluded-account set is monotone and the account table is finite,
 so a walk that must grow that set on every `failover_next` terminates. Selection
 already fails with `no_accounts` or `usage_limit_reached` once everything usable
-is excluded — that failure *is* the pool-exhaustion signal, and it is the same
-signal `probe_pool_usage_exhaustion` reads.
+is excluded — that failure is the walk-exhaustion signal. The terminal response
+still depends on either the walk's per-account exhaustion evidence or the
+independent `probe_pool_usage_exhaustion` result.
 
 The runaway ceiling is therefore not the primary bound. It exists because a
 selector bug that keeps returning fresh-looking accounts would otherwise spin

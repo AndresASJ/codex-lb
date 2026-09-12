@@ -4,13 +4,13 @@
 
 ### Requirement: Streaming usage-limit failures request an immediate coalesced usage refresh
 
-When an upstream stream fails with a rejection the proxy classifies as an account
-usage limit, the proxy MUST request an immediate usage refresh for the failing
-account in addition to marking it rate limited. The trigger is the
-classification, not the literal error code: upstream proves the same condition
-with the code `usage_limit_reached` and, on the code-less and
-`invalid_request_error` paths, with the message alone, and both must record the
-same evidence. The refresh MUST run as a tracked background task that
+The proxy MUST request an immediate usage refresh for the failing account when
+an upstream stream fails with a rejection whose classifier result reports
+distinct usage-limit evidence. It still marks that account rate limited. The trigger is
+that usage-limit evidence field, not the literal error code and not the broader
+`failure_class`: upstream proves the same condition with the code
+`usage_limit_reached` and, on the code-less and `invalid_request_error` paths,
+with the message alone, and both must record the same evidence. The refresh MUST run as a tracked background task that
 never blocks or alters the response, MUST load the account from a fresh
 background-session row rather than the request's `Account` instance, and MUST
 bypass the usage freshness gate. Usage refreshes run on two per-account
@@ -28,7 +28,7 @@ cooldown, or when the fresh row is missing, `paused`, `reauth_required`, or
 invalidate the account selection cache, so the next selection observes the new
 usage evidence without waiting out the cache TTL. Plain `rate_limit_exceeded`
 throttling and quota error codes MUST NOT request a refresh; widening the
-trigger to the classification MUST NOT widen it to those.
+trigger to the distinct usage-limit evidence MUST NOT widen it to those.
 
 #### Scenario: A 429 storm produces a single upstream fetch
 
@@ -93,4 +93,3 @@ trigger to the classification MUST NOT widen it to those.
 - **GIVEN** an upstream stream fails with `rate_limit_exceeded` carrying no usage-limit message, or with a quota error code
 - **WHEN** the proxy records account health for it
 - **THEN** no usage refresh is requested
-
