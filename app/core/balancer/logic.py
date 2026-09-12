@@ -980,7 +980,7 @@ def _relative_availability_weighted_candidates(
     current: float,
     power: float,
     top_k: int,
-    stable_membership: bool = False,
+    selection_seed: str | None = None,
 ) -> list[tuple[AccountState, float, float]]:
     raw_scores = [(state, _relative_availability_raw_score(state, current)) for state in available]
     _log_relative_availability_candidate_scores(raw_scores, current=current)
@@ -1004,12 +1004,18 @@ def _relative_availability_weighted_candidates(
     # broken by *recency*: each admitted turn advances the winner's timestamp
     # and ejects it from the top-k on the next turn. A caller that needs the
     # same answer every turn would then cycle through the tied siblings, so it
-    # asks for a membership rule that does not move.
+    # gets a membership rule that does not move -- keyed by its own seed, not
+    # globally, or every thread would be handed the same k accounts and the
+    # rest of an equally-scored pool would never serve a retained turn.
     weighted.sort(
         key=lambda item: (
             -item[1],
             -item[2],
-            *((_stable_tie_breaker(item[0].account_id),) if stable_membership else _usage_sort_key(item[0])),
+            *(
+                (_decorrelated_tie_breaker(item[0].account_id, selection_seed),)
+                if selection_seed is not None
+                else _usage_sort_key(item[0])
+            ),
         )
     )
     safe_top_k = max(1, top_k)
@@ -1053,7 +1059,7 @@ def _select_relative_availability(
         current=current,
         power=power,
         top_k=top_k,
-        stable_membership=selection_seed is not None,
+        selection_seed=selection_seed,
     )
     if not weighted_candidates:
         winner = (
@@ -1118,51 +1124,6 @@ def _select_relative_availability(
 def _seeded_account(pool: list[AccountState], seed: str) -> AccountState:
     """The seed's choice among candidates the strategy was about to draw from."""
     return min(pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, seed))
-
-
-def _seeded_weighted_account(
-    pool: list[AccountState],
-    weights: list[float],
-    seed: str,
-) -> AccountState:
-    """Weighted rendezvous hashing: stable per seed, weighted across seeds.
-
-    Two requirements pull against each other here. A plain keyed-hash pick
-    gives a candidate weighted 0.01 the same share as one weighted 1.0 --
-    stable, but no longer capacity- or error-rate-aware once you look across
-    threads. Scoring each candidate ``w / -ln(u)``, with ``u`` a
-    per-(seed, account) uniform, reproduces the weighted draw's distribution
-    over seeds -- but the weights themselves move as the pool is used, and a
-    caller that needs the same answer every turn would see its pick flip the
-    moment its own admission spent some of that account's credits.
-
-    So the weight is quantized to its power-of-two bucket before scoring. Two
-    accounts an order of magnitude apart stay an order of magnitude apart in
-    the draw, while the drift a single conversation causes inside an isolation
-    window -- a few percent of an account's remaining credits -- cannot move
-    the score at all. A pick can still change when an account genuinely halves
-    its remaining capacity, which is a real change in the pool rather than the
-    self-inflicted rotation the seed exists to prevent.
-
-    Zero-weight candidates are excluded by the caller for the same reason the
-    weighted draw could never return them.
-    """
-    best: tuple[float, str] | None = None
-    winner = pool[0]
-    for state, weight in zip(pool, weights, strict=True):
-        digest = hashlib.blake2b(
-            f"{seed}\x00{state.account_id}".encode("utf-8", "surrogatepass"),
-            digest_size=8,
-        ).digest()
-        # Open interval: ln(0) is undefined and ln(1) is 0.
-        uniform = min(max(int.from_bytes(digest, "big") / 2**64, 1e-18), 1.0 - 1e-16)
-        score = 2.0 ** math.floor(math.log2(weight)) / -math.log(uniform)
-        # The account id breaks exact ties so replicas agree.
-        key = (score, state.account_id)
-        if best is None or key > best:
-            best = key
-            winner = state
-    return winner
 
 
 def _seeded_least_used(available: list[AccountState], seed: str) -> AccountState:
@@ -1333,12 +1294,18 @@ def _select_capacity_weighted(
     if selection_seed is not None:
         # A zero-weight account is one the draw could never have returned while
         # a positive-weight sibling existed -- an account whose effective
-        # secondary credits are spent. The seed must not readmit it, and must
-        # keep the remaining weights' proportions across threads.
-        live = [(state, weight) for state, weight in zip(available, weights, strict=True) if weight > 0.0]
-        return _seeded_weighted_account(
-            [state for state, _ in live],
-            [weight for _, weight in live],
+        # secondary credits are spent. The seed must not readmit it.
+        #
+        # The *magnitudes* are deliberately dropped here, and only here. They
+        # are live: a usage refresh, an elapsed reset, or an error-rate update
+        # moves them without anything about eligibility changing, so a pick
+        # weighted by them puts every seeded thread one refresh away from
+        # flipping -- which is the fan-out this seed exists to prevent. Ordinary
+        # (unseeded) traffic keeps the full weighted draw, so the pool-level
+        # capacity balance is unchanged; a retained thread simply lands
+        # uniformly among the accounts that draw had already accepted.
+        return _seeded_account(
+            [state for state, weight in zip(available, weights, strict=True) if weight > 0.0],
             selection_seed,
         )
     return random.choices(available, weights=weights, k=1)[0]

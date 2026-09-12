@@ -1911,8 +1911,11 @@ async def _select_with_stickiness(
         and chosen.account.account_id != existing
         # The reroute branch already logged its own outcome, retained or not.
         and overload_reroute is None
-        # ...as did the off-pool retention path.
-        and not owner_isolated_off_pool
+        # ...as did the off-pool retention path. And a mapping that is being
+        # *kept* for any reason -- including an ambiguous owner, which is
+        # preserved but deliberately neither refreshed nor counted -- is not a
+        # rebind, whatever account served this turn.
+        and not preserve_existing_mapping_on_fallback
         and overload_backoff_runtime is not None
         and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
     ):

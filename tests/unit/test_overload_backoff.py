@@ -969,12 +969,16 @@ def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
             assert by_reset.account.account_id == "soon", f"{strategy} took the later reset bucket"
 
 
-def test_a_seeded_pick_still_follows_the_draw_s_weights_across_threads() -> None:
-    """Stable for one thread, weighted across many.
+def test_a_seeded_pick_trades_weight_magnitude_for_not_moving() -> None:
+    """The deliberate trade on the seeded path, pinned so it stays deliberate.
 
-    A plain keyed hash would give an account with 1% of the remaining capacity
-    the same share as one with 99% -- each thread's answer fixed, but the fleet
-    no longer capacity-aware. Weighted rendezvous hashing keeps both.
+    The draw's weights are live -- a usage refresh, an elapsed reset or an
+    error-rate update moves them with nothing about eligibility changing -- so a
+    pick weighted by their magnitude puts every retained thread one refresh away
+    from flipping. Inside the isolation window the seeded pick therefore spreads
+    uniformly over the accounts the draw had already accepted, while ordinary
+    traffic keeps the full weighted draw and with it the pool's capacity
+    balance.
     """
 
     now = 2_000_000_000.0
@@ -984,24 +988,51 @@ def test_a_seeded_pick_still_follows_the_draw_s_weights_across_threads() -> None
     small.capacity_credits = 1000.0
     small.secondary_used_percent = 97.0
 
-    picks = []
+    seeded = []
     for index in range(400):
         seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
         result = select_account([large, small], now, routing_strategy="capacity_weighted", selection_seed=seed)
         assert result.account is not None
-        picks.append(result.account.account_id)
+        seeded.append(result.account.account_id)
 
-    large_share = picks.count("large") / len(picks)
-    # ~33x the remaining credits; an unweighted hash would sit at ~0.5.
-    assert large_share > 0.9, large_share
-    # And each thread's own answer is still fixed.
-    seed = isolation_substitute_seed(sticky_key="thread-7", owner_account_id="owner")
-    repeated = set()
-    for _ in range(8):
-        again = select_account([large, small], now, routing_strategy="capacity_weighted", selection_seed=seed)
-        assert again.account is not None
-        repeated.add(again.account.account_id)
-    assert len(repeated) == 1
+    # Uniform over the eligible pool -- not proportional to the 33x capacity gap.
+    assert 0.35 < seeded.count("large") / len(seeded) < 0.65, seeded.count("large") / len(seeded)
+
+    # The unseeded draw is untouched, so the fleet still follows capacity.
+    unseeded = []
+    for _ in range(400):
+        result = select_account([large, small], now, routing_strategy="capacity_weighted")
+        assert result.account is not None
+        unseeded.append(result.account.account_id)
+    assert unseeded.count("large") / len(unseeded) > 0.9, unseeded.count("large") / len(unseeded)
+
+
+def test_a_seeded_pick_still_spreads_threads_over_an_equally_scored_pool() -> None:
+    """Stability per thread must not become herding across threads.
+
+    ``relative_availability`` admits only its top ``k``, and a membership rule
+    keyed globally rather than per thread would hand every retained
+    conversation the same five accounts while the rest of an equally scored
+    pool never served a turn.
+    """
+
+    now = 2_000_000_000.0
+    pool = []
+    for index in range(12):
+        state = _state(f"sibling-{index}")
+        state.capacity_credits = 1000.0
+        state.secondary_used_percent = 10.0
+        pool.append(state)
+
+    picks = set()
+    for index in range(200):
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        result = select_account(pool, now, routing_strategy="relative_availability", selection_seed=seed)
+        assert result.account is not None
+        picks.add(result.account.account_id)
+
+    # Default top-k is 5; a globally keyed membership rule would cap this there.
+    assert len(picks) > 5, sorted(picks)
 
 
 @pytest.mark.parametrize("strategy", ["capacity_weighted", "relative_availability"])
