@@ -1380,6 +1380,39 @@ async def test_request_local_isolation_release_is_logged_as_retained(
 
 
 @pytest.mark.asyncio
+async def test_a_capped_isolated_owner_s_release_is_logged_as_retained_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counter must not undercount the second retention door.
+
+    An owner removed by a cap or an exclusion before selection ran is released
+    by the fallback-preservation path, which used to log only the generic
+    spillover line -- so exactly the releases this change is measured by went
+    missing from the isolation metric.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("clean"), _state("spare")],
+        _sticky_repo("hot"),
+        preserve_existing_mapping_on_fallback=True,
+    )
+
+    assert outcome.selection.account is not None
+    messages = [record.getMessage() for record in caplog.records]
+    retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
+    assert retained, messages
+    assert "mapping=retained" in retained[0]
+    assert "substitute=deterministic" in retained[0]
+    assert "hot" not in retained[0] and "clean" not in retained[0]
+
+
+@pytest.mark.asyncio
 async def test_budget_pressured_isolated_owner_is_released_with_the_secondary_budget_filter() -> None:
     """Round-robin would otherwise take the least-recently-selected sibling
     (the equally pressured one), which the next turn's budget reallocation

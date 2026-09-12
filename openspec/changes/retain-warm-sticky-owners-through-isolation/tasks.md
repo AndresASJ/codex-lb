@@ -14,7 +14,7 @@
 - [x] 2.7 `_select_with_stickiness`: a retained TTL mapping is rewritten onto its own owner instead of going silent -- both from the isolation branch and from the fallback-preservation path, where the owner never reached selection -- because the default affinity TTL and the default isolation window are both 1800 s. Scoped to isolation: for a merely rate-limited owner the TTL expiring is the intended escape.
 - [x] 2.4 `_select_with_stickiness`: set `overload_reroute_request_local` alongside `reallocate_sticky` and, in the mutation block, take `persist_fallback = False` for that case instead of `_StickyMutation(account_id=None)`. `reallocate_sticky` is still set so the pinned-owner return and the rate-limit grace retry are skipped as before.
 - [x] 2.5 Capture the caller's `reallocate_sticky` before the isolation branch reuses that local, and take the request-local path only when the caller did not ask for reallocation. An explicit reallocation during isolation still retires the mapping.
-- [x] 2.6 `sticky_owner_overload_isolation_reroute` carries `mapping=retained|rebound` and `substitute=deterministic|weighted`; still no account identifiers.
+- [x] 2.6 `sticky_owner_overload_isolation_reroute` carries `mapping=retained|rebound` and `substitute=deterministic|weighted`; still no account identifiers. Emitted from the fallback-preservation path too, so a release of an owner that never reached selection is counted rather than showing up only as a generic spillover.
 
 ## 3. Verification
 

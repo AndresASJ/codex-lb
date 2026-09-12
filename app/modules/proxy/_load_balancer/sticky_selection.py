@@ -1822,6 +1822,18 @@ async def _select_with_stickiness(
     # strategy rejects every overload-free candidate. The pinned-owner paths
     # above never consult the overload window, so an established owner keeps
     # serving its session even while backed off.
+    # The owner is isolated *and* absent from selection -- a concurrency cap or
+    # this request's exclusion list removed it before selection ran, so the
+    # isolation branch above never saw a ``pinned`` state for it. Everything
+    # that branch does for a retained owner has to happen here too.
+    owner_isolated_off_pool = (
+        preserve_existing_mapping_on_fallback
+        and isinstance(existing, str)
+        and not persist_fallback
+        and not reallocate_sticky
+        and overload_backoff_runtime is not None
+        and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
+    )
     fallback_candidates = states
     if overload_reroute is not None and overload_reroute_pool is not None:
         fallback_candidates = overload_reroute_pool
@@ -1844,17 +1856,25 @@ async def _select_with_stickiness(
                 fallback_candidates,
                 selection_seed=isolation_substitute_seed(sticky_key=sticky_key, owner_account_id=existing),
             )
-            if seeded.account is not None:
+            substitute_is_stable = seeded.account is not None
+            if substitute_is_stable:
                 chosen = seeded
-    if (
-        pending_mutation is None
-        and sticky_max_age_seconds is not None
-        and isinstance(existing, str)
-        and not persist_fallback
-        and not reallocate_sticky
-        and overload_backoff_runtime is not None
-        and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
-    ):
+            serving = chosen.account
+            if owner_isolated_off_pool and serving is not None and serving.account_id != existing:
+                # This is an isolation release too -- the owner is isolated and
+                # a sibling is serving its turn -- so it belongs in the same
+                # counter. Leaving it to the generic spillover line would
+                # undercount exactly the releases this change is measured by.
+                # Account identifiers stay out, as on the branch above.
+                logger.info(
+                    "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d "
+                    "mapping=%s substitute=%s",
+                    sticky_kind.value,
+                    len(fallback_candidates),
+                    "retained",
+                    "deterministic" if substitute_is_stable else "weighted",
+                )
+    if pending_mutation is None and sticky_max_age_seconds is not None and owner_isolated_off_pool:
         # The owner is isolated and its mapping is being kept, but it never
         # reached ``selection_states`` -- a cap or this request's exclusion
         # list removed it -- so the retention branch above could not see a
