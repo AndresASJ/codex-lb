@@ -2037,8 +2037,18 @@ async def test_budget_pressured_isolated_owner_is_released_with_the_secondary_bu
 
 
 @pytest.mark.asyncio
-async def test_off_pool_budget_pressured_isolated_owner_uses_the_secondary_budget_filter() -> None:
-    """The cap/exclusion path must carry the same budget filter as pinned retention."""
+@pytest.mark.parametrize("owner_status", [AccountStatus.ACTIVE, AccountStatus.RATE_LIMITED])
+async def test_off_pool_budget_pressured_isolated_owner_uses_the_secondary_budget_filter(
+    owner_status: AccountStatus,
+) -> None:
+    """The cap/exclusion path must carry the same budget filter as pinned retention.
+
+    Including for a rate-limited owner: the pinned branch skips the filter for
+    that status because such an owner takes the grace-retry path instead of
+    budget reallocation, but an owner that never reached selection has no grace
+    path to take, so skipping it would just hand the substitute to a sibling the
+    budget rule excludes.
+    """
 
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     balancer = LoadBalancer(_mock_repo_factory, clock=clock)
@@ -2055,14 +2065,33 @@ async def test_off_pool_budget_pressured_isolated_owner_uses_the_secondary_budge
         )
 
     owner = _st("owner", 85.0, None)
+    owner.status = owner_status
     pressured = _st("pressured", 85.0, None)
     safe = _st("safe", 20.0, clock.time())
     states = [pressured, safe]
     account_map = {state.account_id: cast(Account, AsyncMock()) for state in states}
-    outcome = await balancer._select_with_stickiness(
+    # Several threads: the substitute is seeded per sticky key, so a single key
+    # can land on the safe sibling by luck even when the filter is missing.
+    for index in range(12):
+        outcome = await _off_pool_budget_outcome(balancer, states, account_map, f"budget-key-{index}", owner, safe)
+        assert outcome.selection.account is not None
+        assert outcome.selection.account.account_id == "safe", outcome.selection.account.account_id
+        assert outcome.mutation is not None
+        _assert_owner_retained(outcome, "owner")
+
+
+async def _off_pool_budget_outcome(
+    balancer: LoadBalancer,
+    states: list[AccountState],
+    account_map: dict[str, Account],
+    sticky_key: str,
+    owner: AccountState,
+    safe: AccountState,
+):
+    return await balancer._select_with_stickiness(
         states=states,
         account_map=account_map,
-        sticky_key="budget-key",
+        sticky_key=sticky_key,
         sticky_kind=StickySessionKind.PROMPT_CACHE,
         reallocate_sticky=False,
         sticky_max_age_seconds=600,
@@ -2074,12 +2103,8 @@ async def test_off_pool_budget_pressured_isolated_owner_uses_the_secondary_budge
         sticky_repo=_sticky_repo("owner"),
         preserve_existing_mapping_on_fallback=True,
         preserve_reason_request_local=True,
-        usage_exhaustion_states=[owner, pressured, safe],
+        usage_exhaustion_states=[owner, *states],
     )
-    assert outcome.selection.account is not None
-    assert outcome.selection.account.account_id == "safe"
-    assert outcome.mutation is not None
-    _assert_owner_retained(outcome, "owner")
 
 
 # --- burst cooldown (code-less upstream HTTP 429) ----------------------------

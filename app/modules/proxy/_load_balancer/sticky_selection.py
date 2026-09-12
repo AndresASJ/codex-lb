@@ -1884,7 +1884,11 @@ async def _select_with_stickiness(
             )
             and existing_owner_state is not None
             and routing_strategy not in ("sequential_drain", "reset_drain", "single_account")
-            and existing_owner_state.status != AccountStatus.RATE_LIMITED
+            # Unlike the pinned branch, no RATE_LIMITED carve-out. There the
+            # exclusion exists because a rate-limited owner takes the separate
+            # grace-retry path instead of budget reallocation; here the owner
+            # never reached selection at all, so skipping the filter would just
+            # hand its replacement to a sibling the budget rule excludes.
             and _state_above_sticky_budget_threshold(
                 existing_owner_state,
                 budget_threshold_pct,
