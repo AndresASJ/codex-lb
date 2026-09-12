@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import app.modules.proxy._service.streaming.helpers as streaming_helpers_module
 from app.core.balancer import ERROR_BACKOFF_THRESHOLD
 from app.core.balancer.logic import (
     HEALTH_TIER_DRAINING,
+    HEALTH_TIER_PROBING,
     ROUTING_POLICY_PRESERVE,
     AccountState,
     RoutingCost,
@@ -808,6 +810,7 @@ async def _select_sticky_outcome(
     reallocate_sticky: bool = False,
     secondary_budget_threshold_pct: float = 100.0,
     preserve_existing_mapping_on_fallback: bool = False,
+    preserve_reason_request_local: bool | None = None,
 ):
     account_map = {state.account_id: cast(Account, AsyncMock()) for state in states}
     return await balancer._select_with_stickiness(
@@ -819,6 +822,13 @@ async def _select_sticky_outcome(
         sticky_max_age_seconds=600 if kind == StickySessionKind.PROMPT_CACHE else None,
         secondary_budget_threshold_pct=secondary_budget_threshold_pct,
         preserve_existing_mapping_on_fallback=preserve_existing_mapping_on_fallback,
+        # These cases stand in for a capped or retry-excluded owner, which is
+        # what request-local preservation means, unless a case says otherwise.
+        preserve_reason_request_local=(
+            preserve_existing_mapping_on_fallback
+            if preserve_reason_request_local is None
+            else preserve_reason_request_local
+        ),
         prefer_earlier_reset_accounts=False,
         prefer_earlier_reset_window="secondary",
         routing_strategy="usage_weighted",
@@ -1033,6 +1043,43 @@ def test_a_seeded_pick_is_stable_even_when_every_sibling_is_spent() -> None:
             picks.append(result.account.account_id)
             result.account.last_selected_at = now + turn
         assert len(set(picks)) == 1, f"{strategy}: {picks}"
+
+
+@pytest.mark.asyncio
+async def test_a_seeded_pick_does_not_carry_recovery_probes() -> None:
+    """A recovery probe is the one admission that is *meant* to move.
+
+    The due probe is whichever probing account went quiet longest, so admitting
+    one advances its clock and hands the next turn to a different sibling --
+    precisely the rotation a retained thread is being protected from. Probes
+    ride on every other request instead, so nothing here starves recovery.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+    # Probe due-ness is measured against the wall clock inside ``select_account``
+    # (it takes no ``now``), so these timestamps are real-time, not virtual.
+    probing = []
+    for index in range(3):
+        state = _state(f"probing-{index}")
+        state.health_tier = HEALTH_TIER_PROBING
+        state.last_selected_at = time.time() - 600.0 - index
+        probing.append(state)
+    states = [_state("hot"), *probing]
+
+    picks = []
+    for _ in range(24):
+        outcome = await _select_sticky_outcome(balancer, states, _sticky_repo("hot"))
+        assert outcome.selection.account is not None
+        picks.append(outcome.selection.account.account_id)
+        for state in states:
+            if state.account_id == picks[-1]:
+                # What admission does to the winner, and what used to hand the
+                # next turn to one of its siblings.
+                state.last_selected_at = time.time()
+
+    assert len(set(picks)) == 1, picks
 
 
 @pytest.mark.asyncio
@@ -1511,6 +1558,32 @@ async def test_request_local_isolation_release_is_logged_as_retained(
     assert "substitute=deterministic" in retained[0]
     # Account identifiers must not leak onto this unflagged diagnostic.
     assert "hot" not in retained[0] and "clean" not in retained[0]
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguously_owned_mapping_is_not_treated_as_a_warm_owner() -> None:
+    """Not every preserved mapping is a warm owner waiting out isolation.
+
+    ``require_unambiguous_account`` preserves a mapping because the
+    conversation's ownership is ambiguous, and that owner may be outside this
+    request's routable or security scope. Refreshing it would pin the thread to
+    an account that cannot serve it, turn after turn.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("clean"), _state("spare")],
+        _sticky_repo("hot"),
+        preserve_existing_mapping_on_fallback=True,
+        preserve_reason_request_local=False,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.mutation is None, "an ambiguously owned mapping must not be refreshed onto its owner"
 
 
 @pytest.mark.asyncio

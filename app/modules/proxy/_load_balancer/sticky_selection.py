@@ -277,6 +277,7 @@ class StickySelectionOwner(Protocol):
         sticky_existing_account_id: str | None | object,
         initial_preferred_account_id: str | None,
         preserve_existing_mapping_on_fallback: bool,
+        preserve_reason_request_local: bool = False,
         traffic_class: TrafficClass,
         ignore_standard_quota: bool,
         allow_usage_exhaustion_error: bool = True,
@@ -696,29 +697,35 @@ async def run_sticky_selection_path(
             # ``_run_select_with_stickiness``), so an owner that is both
             # capped and isolated preserves too -- rebinding it would strand
             # the thread on the sibling after both conditions clear.
-            preserve_existing_mapping = (
+            # Why the mapping is being kept matters downstream: only pressure
+            # that is *request-local* (a cap, this request's exclusion list)
+            # means "this owner can serve the next turn". An owner kept because
+            # the conversation's ownership is ambiguous
+            # (``require_unambiguous_account``) may be out of this request's
+            # routable or security scope entirely, and must not be treated as a
+            # warm owner waiting out an isolation window.
+            preserve_reason_request_local = (
                 bare_session_key
                 and isinstance(sticky_existing_account_id, str)
                 and (
-                    (
-                        cap_spillover_allowed
-                        # An explicit reallocation is an instruction to retire
-                        # the mapping, and it outranks cap spillover exactly as
-                        # it already does on the TTL-bounded branch below.
-                        # Without this the owner is absent from
-                        # ``selection_states``, so the later
-                        # ``caller_requested_reallocation`` guard is never
-                        # reached and the row survives a reallocation that used
-                        # to rebind it. ``require_unambiguous_account`` is not
-                        # gated: that arm is a correctness requirement about an
-                        # ambiguous conversation owner, not a locality
-                        # preference, so a caller cannot waive it.
-                        and not reallocate_sticky
-                        and any(state.account_id == sticky_existing_account_id for state in states)
-                        and not any(state.account_id == sticky_existing_account_id for state in selection_states)
-                    )
-                    or require_unambiguous_account
+                    cap_spillover_allowed
+                    # An explicit reallocation is an instruction to retire the
+                    # mapping, and it outranks cap spillover exactly as it
+                    # already does on the TTL-bounded branch below. Without
+                    # this the owner is absent from ``selection_states``, so
+                    # the later ``caller_requested_reallocation`` guard is
+                    # never reached and the row survives a reallocation that
+                    # used to rebind it. The ``require_unambiguous_account``
+                    # arm below is not gated: it is a correctness requirement
+                    # about an ambiguous conversation owner, not a locality
+                    # preference, so a caller cannot waive it.
+                    and not reallocate_sticky
+                    and any(state.account_id == sticky_existing_account_id for state in states)
+                    and not any(state.account_id == sticky_existing_account_id for state in selection_states)
                 )
+            )
+            preserve_existing_mapping = preserve_reason_request_local or (
+                bare_session_key and isinstance(sticky_existing_account_id, str) and require_unambiguous_account
             )
             if (
                 not preserve_existing_mapping
@@ -742,13 +749,16 @@ async def run_sticky_selection_path(
                 # so such an owner never reaches ``states`` and this predicate
                 # is already false for it. Only the exclusion arm below can see
                 # an owner outside that filter, and it checks the status.
-                preserve_existing_mapping = any(state.account_id == sticky_existing_account_id for state in states) or (
+                preserve_reason_request_local = any(
+                    state.account_id == sticky_existing_account_id for state in states
+                ) or (
                     sticky_existing_account_id in request.exclude_account_ids
                     and any(
                         account.id == sticky_existing_account_id and account.status in _RECOVERABLE_STATUSES
                         for account in selection_inputs.effective_continuity_owner_candidates
                     )
                 )
+                preserve_existing_mapping = preserve_reason_request_local
             if suppress_recovery_probe_candidates:
                 selection_states = _filter_recovery_probe_candidates(
                     selection_states,
@@ -895,6 +905,7 @@ async def run_sticky_selection_path(
                             else None
                         ),
                         preserve_existing_mapping_on_fallback=preserve_existing_mapping,
+                        preserve_reason_request_local=preserve_reason_request_local,
                         traffic_class=traffic_class,
                         ignore_standard_quota=False,
                         routing_costs_by_account_id=effective_routing_costs,
@@ -1390,6 +1401,7 @@ async def _select_with_stickiness(
     sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
     initial_preferred_account_id: str | None = None,
     preserve_existing_mapping_on_fallback: bool = False,
+    preserve_reason_request_local: bool = False,
     traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
     ignore_standard_quota: bool = False,
     allow_usage_exhaustion_error: bool = True,
@@ -1848,6 +1860,11 @@ async def _select_with_stickiness(
     # that branch does for a retained owner has to happen here too.
     owner_isolated_off_pool = (
         preserve_existing_mapping_on_fallback
+        # ...for request-local pressure only. A mapping kept because the
+        # conversation's owner is ambiguous may be outside this request's
+        # routable or security scope, and refreshing it would pin the thread
+        # to an account that cannot serve it, turn after turn.
+        and preserve_reason_request_local
         and isinstance(existing, str)
         and not persist_fallback
         and not reallocate_sticky
@@ -2167,9 +2184,17 @@ def _select_account_preferring_budget_safe(
     selection_seed: str | None = None,
 ) -> SelectionResult:
     state_list = list(states)
-    if routing_strategy not in ("sequential_drain", "reset_drain", "single_account"):
+    if selection_seed is None and routing_strategy not in ("sequential_drain", "reset_drain", "single_account"):
         # This pass must precede budget-safe and routing-policy shortcuts below;
         # otherwise a healthy preferred account can starve PROBING indefinitely.
+        #
+        # A seeded caller is exempt. The due probe is whichever probing account
+        # went quiet longest, so admitting one advances its clock and hands the
+        # next turn to a different sibling -- the rotation the seed exists to
+        # prevent. Probes ride on unbound traffic and on every other thread
+        # instead, so nothing here starves them; only the handful of
+        # conversations being held warm through an isolation window stop
+        # carrying them.
         recovery_probe = select_account(
             state_list,
             prefer_earlier_reset=prefer_earlier_reset,
