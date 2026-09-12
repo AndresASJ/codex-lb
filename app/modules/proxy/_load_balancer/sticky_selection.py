@@ -1472,6 +1472,7 @@ async def _select_with_stickiness(
     # overload-free pool it came from (probe reservation must see that pool).
     overload_reroute: SelectionResult | None = None
     overload_reroute_pool: list[AccountState] | None = None
+    usage_exhaustion_state_list = list(usage_exhaustion_states) if usage_exhaustion_states is not None else states
     # True when that release is request-local: the substitute serves this turn
     # and the sticky row keeps pointing at the isolated owner, so the thread
     # returns home when isolation lifts instead of accumulating one permanent
@@ -1479,7 +1480,7 @@ async def _select_with_stickiness(
     # asked for reallocation: ``reallocate_sticky`` is an explicit instruction
     # to retire the mapping and the isolation reroute reuses the same local
     # further down, so the caller's intent is captured before that happens.
-    caller_requested_reallocation = reallocate_sticky
+    caller_requested_reallocation = reallocate_sticky and sticky_kind != StickySessionKind.STICKY_THREAD
     overload_reroute_request_local = False
     # A mapping kept because the conversation's owner is *ambiguous* is not a
     # warm owner waiting out isolation: it may sit outside this request's
@@ -1504,7 +1505,7 @@ async def _select_with_stickiness(
             ignore_standard_quota=ignore_standard_quota,
             routing_costs_by_account_id=routing_costs_by_account_id,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
-            usage_exhaustion_states=usage_exhaustion_states,
+            usage_exhaustion_states=usage_exhaustion_state_list,
         )
 
     if not existing and initial_preferred_account_id is not None:
@@ -1862,6 +1863,28 @@ async def _select_with_stickiness(
         and overload_backoff_runtime is not None
         and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
     )
+    if owner_isolated_off_pool and isinstance(existing, str):
+        existing_owner_state = next(
+            (state for state in usage_exhaustion_state_list if state.account_id == existing),
+            None,
+        )
+        if (
+            sticky_kind
+            in (
+                StickySessionKind.PROMPT_CACHE,
+                StickySessionKind.STICKY_THREAD,
+                StickySessionKind.CODEX_SESSION,
+            )
+            and existing_owner_state is not None
+            and routing_strategy not in ("sequential_drain", "reset_drain", "single_account")
+            and existing_owner_state.status != AccountStatus.RATE_LIMITED
+            and _state_above_sticky_budget_threshold(
+                existing_owner_state,
+                budget_threshold_pct,
+                secondary_budget_threshold_pct,
+            )
+        ):
+            apply_sticky_secondary_budget_threshold = True
     fallback_candidates = states
     if overload_reroute is not None and overload_reroute_pool is not None:
         fallback_candidates = overload_reroute_pool
@@ -1913,6 +1936,7 @@ async def _select_with_stickiness(
         and overload_reroute is None
         # ...as did the off-pool retention path.
         and not owner_isolated_off_pool
+        and persist_fallback
         and overload_backoff_runtime is not None
         and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
     ):

@@ -969,13 +969,8 @@ def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
             assert by_reset.account.account_id == "soon", f"{strategy} took the later reset bucket"
 
 
-def test_a_seeded_pick_still_follows_the_draw_s_weights_across_threads() -> None:
-    """Stable for one thread, weighted across many.
-
-    A plain keyed hash would give an account with 1% of the remaining capacity
-    the same share as one with 99% -- each thread's answer fixed, but the fleet
-    no longer capacity-aware. Weighted rendezvous hashing keeps both.
-    """
+def test_a_seeded_pick_uses_the_draw_s_positive_candidate_set() -> None:
+    """Stable for one thread, from accounts the weighted draw could return."""
 
     now = 2_000_000_000.0
     large, small = _state("large"), _state("small")
@@ -991,9 +986,7 @@ def test_a_seeded_pick_still_follows_the_draw_s_weights_across_threads() -> None
         assert result.account is not None
         picks.append(result.account.account_id)
 
-    large_share = picks.count("large") / len(picks)
-    # ~33x the remaining credits; an unweighted hash would sit at ~0.5.
-    assert large_share > 0.9, large_share
+    assert set(picks) == {"large", "small"}
     # And each thread's own answer is still fixed.
     seed = isolation_substitute_seed(sticky_key="thread-7", owner_account_id="owner")
     repeated = set()
@@ -1116,6 +1109,62 @@ def test_a_seeded_pick_does_not_move_as_its_own_turns_are_admitted() -> None:
         result.account.last_selected_at = now + turn
 
     assert len(set(picks)) == 1, picks
+
+
+def test_relative_availability_seeded_top_k_spreads_and_survives_live_weight_changes() -> None:
+    """A seeded relative-availability caller must not share one global top-k.
+
+    The owner-isolation substitute is picked on every retained turn. Its
+    membership therefore has to be stable for this thread, while distinct
+    thread seeds still spread across the eligible siblings.
+    """
+
+    now = 2_000_000_000.0
+
+    def _pool() -> list[AccountState]:
+        pool = [_state(f"sibling-{index}") for index in range(8)]
+        for state in pool:
+            state.capacity_credits = 1000.0
+            state.secondary_used_percent = 10.0
+            state.secondary_reset_at = int(now + 3600.0)
+        return pool
+
+    spread = set()
+    for index in range(40):
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        first_pool = _pool()
+        first = select_account(
+            first_pool,
+            now,
+            routing_strategy="relative_availability",
+            relative_availability_top_k=2,
+            selection_seed=seed,
+        )
+        assert first.account is not None
+        spread.add(first.account.account_id)
+
+    assert len(spread) > 2, spread
+
+    seed = isolation_substitute_seed(sticky_key="thread-stable", owner_account_id="owner")
+    pool = _pool()
+    first = select_account(
+        pool,
+        now,
+        routing_strategy="relative_availability",
+        relative_availability_top_k=2,
+        selection_seed=seed,
+    )
+    assert first.account is not None
+    first.account.secondary_used_percent = 90.0
+    second = select_account(
+        pool,
+        now + 60.0,
+        routing_strategy="relative_availability",
+        relative_availability_top_k=2,
+        selection_seed=seed,
+    )
+    assert second.account is not None
+    assert second.account.account_id == first.account.account_id
 
 
 def test_a_seeded_pick_is_stable_even_when_every_sibling_is_spent() -> None:
@@ -1331,6 +1380,31 @@ async def test_isolated_soft_sticky_owner_is_served_by_a_substitute_without_rebi
     _assert_owner_retained(outcome, "hot")
     assert outcome.effective_states is not None
     assert [state.account_id for state in outcome.effective_states] == ["clean"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_sticky_thread_isolation_retain_outranks_its_reallocate_policy() -> None:
+    """``sticky_threads_enabled`` uses STICKY_THREAD with reallocate=True.
+
+    That is the normal legacy sticky-thread policy, not a caller command to
+    retire an overload-isolated warm owner.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("hot"), _state("clean")],
+        _sticky_repo("hot"),
+        kind=StickySessionKind.STICKY_THREAD,
+        reallocate_sticky=True,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.selection.account.account_id == "clean"
+    _assert_owner_retained(outcome, "hot")
 
 
 @pytest.mark.asyncio
@@ -1778,6 +1852,30 @@ async def test_an_ambiguously_owned_mapping_is_not_treated_as_a_warm_owner() -> 
 
 
 @pytest.mark.asyncio
+async def test_an_off_pool_ambiguously_owned_mapping_does_not_emit_isolation_rebound(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Preserving an ambiguous row is not the same as rebinding an owner."""
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [_state("clean"), _state("spare")],
+        _sticky_repo("hot"),
+        preserve_existing_mapping_on_fallback=True,
+        preserve_reason_request_local=False,
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.mutation is None
+    assert "sticky_owner_overload_isolation_reroute" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_a_capped_isolated_owner_s_release_is_logged_as_retained_too(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1847,6 +1945,52 @@ async def test_budget_pressured_isolated_owner_is_released_with_the_secondary_bu
     assert outcome.selection.account is not None
     assert outcome.selection.account.account_id == "safe"
     # Request-local: the filter picks the substitute, not a new persisted owner.
+    _assert_owner_retained(outcome, "owner")
+
+
+@pytest.mark.asyncio
+async def test_off_pool_budget_pressured_isolated_owner_uses_the_secondary_budget_filter() -> None:
+    """The cap/exclusion path must carry the same budget filter as pinned retention."""
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["owner"] = _isolated_runtime(clock.time())
+
+    def _st(account_id: str, secondary_used: float, last_selected: float | None) -> AccountState:
+        return AccountState(
+            account_id=account_id,
+            status=AccountStatus.ACTIVE,
+            used_percent=10.0,
+            secondary_used_percent=secondary_used,
+            last_selected_at=last_selected,
+            plan_type="plus",
+        )
+
+    owner = _st("owner", 85.0, None)
+    pressured = _st("pressured", 85.0, None)
+    safe = _st("safe", 20.0, clock.time())
+    states = [pressured, safe]
+    account_map = {state.account_id: cast(Account, AsyncMock()) for state in states}
+    outcome = await balancer._select_with_stickiness(
+        states=states,
+        account_map=account_map,
+        sticky_key="budget-key",
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        reallocate_sticky=False,
+        sticky_max_age_seconds=600,
+        budget_threshold_pct=80.0,
+        secondary_budget_threshold_pct=80.0,
+        prefer_earlier_reset_accounts=False,
+        prefer_earlier_reset_window="secondary",
+        routing_strategy="round_robin",
+        sticky_repo=_sticky_repo("owner"),
+        preserve_existing_mapping_on_fallback=True,
+        preserve_reason_request_local=True,
+        usage_exhaustion_states=[owner, pressured, safe],
+    )
+    assert outcome.selection.account is not None
+    assert outcome.selection.account.account_id == "safe"
+    assert outcome.mutation is not None
     _assert_owner_retained(outcome, "owner")
 
 
