@@ -1466,6 +1466,21 @@ async def _select_with_stickiness(
     caller_requested_reallocation = reallocate_sticky
     overload_reroute_request_local = False
 
+    def _above_choose_from_budget_threshold(state: AccountState) -> bool:
+        """The exact over-budget predicate ``_choose_from`` filters its pool with.
+
+        Mirroring the selector matters: its notion of over-budget reads priority
+        and secondary usage, so a stand-in that only compared ``used_percent``
+        would readmit an account exhausted on an axis it cannot see.
+        """
+        if apply_sticky_secondary_budget_threshold:
+            return _state_above_sticky_budget_threshold(
+                state,
+                budget_threshold_pct,
+                secondary_budget_threshold_pct,
+            )
+        return _state_above_budget_threshold(state, budget_threshold_pct)
+
     def _choose_from(candidates: list[AccountState]) -> SelectionResult:
         return _select_account_preferring_budget_safe(
             candidates,
@@ -1652,7 +1667,7 @@ async def _select_with_stickiness(
                         budget_peer_pool(
                             overload_reroute_pool,
                             candidate.account,
-                            budget_threshold_pct=budget_threshold_pct,
+                            is_above_budget_threshold=_above_choose_from_budget_threshold,
                         ),
                         sticky_key=sticky_key,
                         owner_account_id=pinned.account_id,
@@ -1869,7 +1884,7 @@ async def _select_with_stickiness(
                 budget_peer_pool(
                     fallback_candidates,
                     chosen.account,
-                    budget_threshold_pct=budget_threshold_pct,
+                    is_above_budget_threshold=_above_choose_from_budget_threshold,
                 ),
                 sticky_key=sticky_key,
                 owner_account_id=existing,

@@ -780,6 +780,7 @@ async def _select_sticky_outcome(
     initial_preferred_account_id: str | None = None,
     sticky_key: str = "owned-key",
     reallocate_sticky: bool = False,
+    secondary_budget_threshold_pct: float = 100.0,
 ):
     account_map = {state.account_id: cast(Account, AsyncMock()) for state in states}
     return await balancer._select_with_stickiness(
@@ -789,6 +790,7 @@ async def _select_sticky_outcome(
         sticky_kind=kind,
         reallocate_sticky=reallocate_sticky,
         sticky_max_age_seconds=600 if kind == StickySessionKind.PROMPT_CACHE else None,
+        secondary_budget_threshold_pct=secondary_budget_threshold_pct,
         prefer_earlier_reset_accounts=False,
         prefer_earlier_reset_window="secondary",
         routing_strategy="usage_weighted",
@@ -797,29 +799,58 @@ async def _select_sticky_outcome(
     )
 
 
-def _used(account_id: str, used_percent: float) -> AccountState:
-    return AccountState(account_id=account_id, status=AccountStatus.ACTIVE, used_percent=used_percent)
+def _over_budget_on(axis: str, account_id: str) -> AccountState:
+    """A sibling the selector rejects as over budget on exactly one axis.
+
+    The default sticky budget threshold is 95%, and the selector reads priority
+    usage in preference to raw usage and checks the secondary window too, so
+    each of these is invisible to a filter that only compares ``used_percent``.
+    """
+    state = AccountState(account_id=account_id, status=AccountStatus.ACTIVE, used_percent=0.0)
+    if axis == "primary":
+        state.used_percent = 99.0
+    elif axis == "priority":
+        state.priority_used_percent = 99.0
+    else:
+        state.secondary_used_percent = 99.0
+        state.priority_secondary_used_percent = 99.0
+    return state
 
 
 @pytest.mark.asyncio
-async def test_substitute_never_crosses_the_budget_threshold() -> None:
+@pytest.mark.parametrize("axis", ["primary", "priority", "secondary"])
+async def test_a_substitute_never_crosses_the_budget_threshold(axis: str) -> None:
     """The selector's budget filter is pool-relative.
 
     ``_select_account_preferring_budget_safe`` accepts an over-budget account
     only when no safe one is visible, so validating a deterministic preference
-    on the candidate *alone* hid that filter: a thread could be pinned to an
-    85%-used sibling while a 20%-used one sat in the same pool.
+    on the candidate *alone* hides that filter: the thread could be pinned to an
+    exhausted sibling while a safe one sat in the same pool. The scoping that
+    prevents it has to mirror the selector on *every* axis it reads -- priority
+    and secondary usage included -- or it readmits what it meant to exclude.
     """
 
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     balancer = LoadBalancer(_mock_repo_factory, clock=clock)
     balancer._runtime["hot"] = _isolated_runtime(clock.time())
-    states = [_used("hot", 0.0), _used("safe", 20.0), _used("pressured", 85.0)]
+    # The owner is itself over budget, so the reroute turns the secondary
+    # threshold on: the substitute is filtered exactly as the pool pick is.
+    owner = _over_budget_on("primary", "hot")
+    states = [owner, _state("safe"), _over_budget_on(axis, "pressured")]
 
-    for _ in range(12):
-        outcome = await _select_sticky_outcome(balancer, states, _sticky_repo("hot"))
+    for index in range(24):
+        outcome = await _select_sticky_outcome(
+            balancer,
+            states,
+            _sticky_repo("hot"),
+            sticky_key=f"thread-{index}",
+            # The secondary window has its own threshold; lowering it keeps the
+            # fixture's usage figures inside the 0-100 range a real account
+            # reports while still putting the sibling over the line.
+            secondary_budget_threshold_pct=90.0,
+        )
         assert outcome.selection.account is not None
-        assert outcome.selection.account.account_id == "safe", outcome.selection.account.account_id
+        assert outcome.selection.account.account_id == "safe", f"{axis}-exhausted sibling served thread-{index}"
 
 
 @pytest.mark.asyncio

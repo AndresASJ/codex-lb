@@ -67,7 +67,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -366,7 +366,7 @@ def budget_peer_pool(
     pool: list[AccountState],
     reference: AccountState,
     *,
-    budget_threshold_pct: float,
+    is_above_budget_threshold: Callable[[AccountState], bool],
 ) -> list[AccountState]:
     """The pool members no worse than ``reference`` on the budget-safe axis.
 
@@ -380,15 +380,15 @@ def budget_peer_pool(
     while preserving the spread the hash exists for: a preference among equally
     safe siblings is exactly what it should express, and a preference that
     crosses the threshold is exactly what it should not.
+
+    ``is_above_budget_threshold`` must be the *same* predicate the caller's pool
+    pick filters with -- the selector's notion of over-budget reads priority and
+    secondary usage, not only ``used_percent``, and a cheaper stand-in here
+    would readmit an account exhausted on an axis this filter cannot see.
     """
-
-    def _safe(state: AccountState) -> bool:
-        used = state.used_percent
-        return used is None or used <= budget_threshold_pct
-
-    if not _safe(reference):
+    if is_above_budget_threshold(reference):
         return list(pool)
-    return [state for state in pool if _safe(state)] or list(pool)
+    return [state for state in pool if not is_above_budget_threshold(state)] or list(pool)
 
 
 def deterministic_isolation_substitute(
