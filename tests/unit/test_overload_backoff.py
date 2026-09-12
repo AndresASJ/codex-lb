@@ -968,6 +968,26 @@ def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
             assert by_reset.account.account_id == "soon", f"{strategy} took the later reset bucket"
 
 
+def test_a_seeded_pick_leaves_fill_first_s_ranking_alone() -> None:
+    """``fill_first`` drains an account before opening the next.
+
+    Its ranking is already stable across admissions, so a seed has nothing to
+    add there and would only scatter threads onto fresh accounts -- the
+    opposite of what the strategy is for.
+    """
+
+    now = 2_000_000_000.0
+    draining, fresh = _state("draining"), _state("fresh")
+    draining.used_percent = 90.0
+    fresh.used_percent = 0.0
+
+    for index in range(24):
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        result = select_account([draining, fresh], now, routing_strategy="fill_first", selection_seed=seed)
+        assert result.account is not None
+        assert result.account.account_id == "draining", "fill-first opened a fresh account"
+
+
 def test_a_seeded_pick_skips_an_account_the_draw_could_never_have_returned() -> None:
     """Weight zero means "spent", and a weighted draw can never return it while
     a positive-weight sibling exists. Hashing over the raw pool could."""

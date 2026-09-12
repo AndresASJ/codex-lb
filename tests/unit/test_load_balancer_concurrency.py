@@ -3443,6 +3443,77 @@ async def test_isolated_and_capped_prompt_cache_owner_keeps_its_mapping() -> Non
         await balancer.release_account_lease(lease)
 
 
+def _make_probing_pool_balancer(
+    prefix: str,
+    *,
+    probing_count: int = 3,
+) -> tuple[LoadBalancer, Account, Account, _StubStickySessionsRepository]:
+    """An owner, one healthy sibling, and several due PROBING siblings."""
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    owner = _make_account(f"{prefix}-owner")
+    healthy = _make_account(f"{prefix}-healthy")
+    probing = [_make_account(f"{prefix}-probing-{index}") for index in range(probing_count)]
+    accounts = [owner, healthy, *probing]
+    usage_rows = {
+        account.id: _usage_row(index + 100, account.id, window="primary", reset_at=now_epoch + 300)
+        for index, account in enumerate(accounts)
+    }
+    secondary_rows = {
+        account.id: _usage_row(index + 200, account.id, window="secondary", reset_at=now_epoch + 3600)
+        for index, account in enumerate(accounts)
+    }
+    sticky_repo = _StubStickySessionsRepository()
+    sticky_repo.account_id = owner.id
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            _StubAccountsRepository(accounts),
+            _StubUsageRepository(usage_rows, secondary_rows),
+            sticky_repo,
+        )
+    )
+    for index, account in enumerate(probing):
+        balancer._runtime[account.id] = RuntimeState(
+            health_tier=HEALTH_TIER_PROBING,
+            last_selected_at=balancer._clock.time() - PROBE_QUIET_SECONDS * 10 - index,
+        )
+    return balancer, owner, healthy, sticky_repo
+
+
+@pytest.mark.asyncio
+async def test_retained_thread_does_not_rotate_through_due_probes() -> None:
+    """The public routing path, with probing siblings in the pool.
+
+    A recovery probe is the one admission that is *meant* to move: the due
+    probe is whichever probing account went quiet longest, so admitting one
+    advances its clock and hands the next turn to a sibling. A retained thread
+    following that rotation would fan out across the pool exactly as the
+    rebinding it replaces did.
+    """
+
+    balancer, owner, healthy, sticky_repo = _make_probing_pool_balancer("thread-probe-rotation")
+    thread_key = "thread-probe-rotation-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    picks = []
+    for _ in range(8):
+        selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+        assert selected.account is not None, selected.error_message
+        picks.append(selected.account.id)
+        await balancer.release_account_lease(selected.lease)
+
+    assert set(picks) == {healthy.id}, picks
+    # Retained throughout: every write is a refresh onto the isolated owner.
+    assert {upsert[1] for upsert in sticky_repo.upserts} == {owner.id}
+    assert sticky_repo.deleted == []
+
+
 @pytest.mark.asyncio
 async def test_capped_prompt_cache_owner_that_is_gone_is_rebound() -> None:
     """Retention is for owners that come back.

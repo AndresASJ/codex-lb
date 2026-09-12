@@ -761,7 +761,19 @@ def select_account(
     # Recovery is a liveness admission inside the already-eligible pool. Pick
     # it before routing-policy preferences so burn/preserve policy cannot make
     # PROBING permanent, but never before quota/cooldown/security filtering.
-    due_probe = _oldest_due_probing_account(probing, current=current) if healthy or recovery_probe_only else None
+    # A seeded caller never carries the probe. The due probe is whichever
+    # probing account went quiet longest, so admitting one advances its clock
+    # and hands the next turn to a different sibling -- the rotation the seed
+    # exists to prevent, and the conversation fan-out the seed exists to stop.
+    # Probes ride on unbound traffic and on every other thread, so this exempts
+    # the handful of conversations being held warm through an isolation window
+    # rather than starving recovery. ``recovery_probe_only`` is the probe pass
+    # itself and is never seeded.
+    due_probe = (
+        _oldest_due_probing_account(probing, current=current)
+        if (healthy or recovery_probe_only) and selection_seed is None
+        else None
+    )
     if recovery_probe_only and due_probe is None:
         return SelectionResult(None, None)
     health_pool = [due_probe] if due_probe is not None else healthy or probing or draining or available
@@ -804,11 +816,11 @@ def select_account(
             if prefer_earlier_reset
             else effective_pool
         )
-        selected = (
-            _seeded_pick(candidate_pool, selection_seed)
-            if selection_seed is not None
-            else _select_fill_first(candidate_pool)
-        )
+        # ``fill_first`` deliberately ranks by *highest* usage to drain an
+        # account before opening the next, and that ranking is already stable
+        # across admissions, so the seed has nothing to add and would only
+        # scatter threads onto fresh accounts.
+        selected = _select_fill_first(candidate_pool)
     else:
         effective_usage_weighted_order: UsageWeightedOrder = (
             "primary_first" if primary_first_usage_weighted else usage_weighted_order
