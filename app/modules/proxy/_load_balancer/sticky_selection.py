@@ -1481,9 +1481,6 @@ async def _select_with_stickiness(
     # further down, so the caller's intent is captured before that happens.
     caller_requested_reallocation = reallocate_sticky
     overload_reroute_request_local = False
-    # Set when an isolation release is known to be permanent but its
-    # replacement is not chosen yet.
-    log_rebound_release_if_replaced = False
 
     def _choose_from(candidates: list[AccountState], *, selection_seed: str | None = None) -> SelectionResult:
         return _select_account_preferring_budget_safe(
@@ -1635,17 +1632,7 @@ async def _select_with_stickiness(
                     owner_account_id=pinned.account_id,
                     now=now,
                 )
-            elif overload_backoff_runtime is not None and overload_isolation_active(
-                overload_backoff_runtime.get(pinned.account_id), now
-            ):
-                # Isolated but past recovering, so the fallback below rebinds
-                # the mapping. That is still an isolation release and belongs
-                # in the same counter, or the metric reports only the reversible
-                # half of what isolation does to a conversation. Deferred until
-                # the fallback has actually chosen a different account: the
-                # request may yet fail, or keep the owner, and a release that
-                # did not happen must not be counted.
-                log_rebound_release_if_replaced = True
+
             if overload_reroute_pool is not None:
                 # A budget-pressured owner's replacement honors the same
                 # secondary-budget filter the budget reallocation applies, so
@@ -1911,12 +1898,26 @@ async def _select_with_stickiness(
                     "retained",
                 )
     if (
-        log_rebound_release_if_replaced
+        isinstance(existing, str)
         and chosen.account is not None
-        and isinstance(existing, str)
         and chosen.account.account_id != existing
+        # The reroute branch already logged its own outcome, retained or not.
+        and overload_reroute is None
+        # ...as did the off-pool retention path.
+        and not owner_isolated_off_pool
+        and overload_backoff_runtime is not None
+        and overload_isolation_active(overload_backoff_runtime.get(existing), clock.time())
     ):
-        # Account identifiers stay out, as on the retained line above.
+        # An isolated owner whose mapping is being rebound rather than kept:
+        # past recovering, dropped before selection ran (``_selectable_accounts``
+        # removes paused and deactivated accounts), or outside this request's
+        # scope. Still an isolation release, and the counter must carry both
+        # halves of what isolation does to a conversation or it reports only the
+        # reversible one.
+        #
+        # Emitted here, where the replacement is known: the request may instead
+        # have failed, or kept its owner, and a release that did not happen must
+        # not be counted. Account identifiers stay out, as on the retained line.
         logger.info(
             "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
             sticky_kind.value,

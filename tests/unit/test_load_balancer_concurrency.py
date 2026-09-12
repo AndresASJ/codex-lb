@@ -3515,6 +3515,45 @@ async def test_retained_thread_does_not_rotate_through_due_probes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_isolated_owner_dropped_before_selection_is_still_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counter has to see releases it never gets a state for.
+
+    ``_selectable_accounts`` removes paused and deactivated accounts before
+    states are built, so an isolated owner in that condition never reaches
+    selection at all -- yet its mapping is still rebound, which is exactly the
+    permanent half of what isolation does to a conversation.
+    """
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-isolated-offpool")
+    assert alternate is not None
+    thread_key = "thread-isolated-offpool-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    owner.status = AccountStatus.PAUSED
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    messages = [record.getMessage() for record in caplog.records]
+    released = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
+    assert released, messages
+    assert "mapping=rebound" in released[0]
+    assert owner.id not in released[0] and alternate.id not in released[0]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
 async def test_capped_prompt_cache_owner_that_is_gone_is_rebound() -> None:
     """Retention is for owners that come back.
 
