@@ -728,7 +728,7 @@ def select_account(
         *which* of the accounts the strategy was about to draw from is taken,
         never whether an account it excluded becomes eligible.
         """
-        return min(pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, seed))
+        return _seeded_account(pool, seed)
 
     round_robin_salt = _effective_replica_salt(replica_salt)
 
@@ -773,7 +773,7 @@ def select_account(
 
     if routing_strategy == "round_robin":
         selected = (
-            _seeded_pick(effective_pool, selection_seed)
+            _seeded_pick(_lowest_planner_cost_candidates(effective_pool, routing_costs), selection_seed)
             if selection_seed is not None
             else min(effective_pool, key=_round_robin_sort_key)
         )
@@ -787,11 +787,7 @@ def select_account(
             selected = min(candidate_pool, key=lambda state: _capacity_probe_sort_key_with_cost(state, routing_costs))
         else:
             candidate_pool = _lowest_planner_cost_candidates(candidate_pool, routing_costs)
-            selected = (
-                _seeded_pick(candidate_pool, selection_seed)
-                if selection_seed is not None
-                else _select_capacity_weighted(candidate_pool)
-            )
+            selected = _select_capacity_weighted(candidate_pool, selection_seed=selection_seed)
     elif routing_strategy == "relative_availability":
         candidate_pool = _lowest_planner_cost_candidates(effective_pool, routing_costs)
         selected = _select_relative_availability(
@@ -818,7 +814,16 @@ def select_account(
             "primary_first" if primary_first_usage_weighted else usage_weighted_order
         )
         if selection_seed is not None:
-            selected = _seeded_pick(effective_pool, selection_seed)
+            # The sort keys this branch would otherwise use put reset bucket
+            # first and planner cost second, so the seed has to be spent below
+            # both: a thread must not be held on a 30-day-reset or high-cost
+            # account the ordering had already ruled out.
+            seeded_pool = (
+                _prefer_earlier_reset_candidates(effective_pool, current, prefer_earlier_reset_window)
+                if effective_prefer_earlier_reset
+                else effective_pool
+            )
+            selected = _seeded_pick(_lowest_planner_cost_candidates(seeded_pool, routing_costs), selection_seed)
         elif effective_usage_weighted_order == "primary_first":
             selected = min(
                 effective_pool,
@@ -963,6 +968,7 @@ def _relative_availability_weighted_candidates(
     current: float,
     power: float,
     top_k: int,
+    stable_membership: bool = False,
 ) -> list[tuple[AccountState, float, float]]:
     raw_scores = [(state, _relative_availability_raw_score(state, current)) for state in available]
     _log_relative_availability_candidate_scores(raw_scores, current=current)
@@ -982,11 +988,16 @@ def _relative_availability_weighted_candidates(
     if not weighted:
         return []
 
+    # ``_usage_sort_key`` ends in ``last_selected_at``, so exact ties are
+    # broken by *recency*: each admitted turn advances the winner's timestamp
+    # and ejects it from the top-k on the next turn. A caller that needs the
+    # same answer every turn would then cycle through the tied siblings, so it
+    # asks for a membership rule that does not move.
     weighted.sort(
         key=lambda item: (
             -item[1],
             -item[2],
-            *_usage_sort_key(item[0]),
+            *((_stable_tie_breaker(item[0].account_id),) if stable_membership else _usage_sort_key(item[0])),
         )
     )
     safe_top_k = max(1, top_k)
@@ -1030,6 +1041,7 @@ def _select_relative_availability(
         current=current,
         power=power,
         top_k=top_k,
+        stable_membership=selection_seed is not None,
     )
     if not weighted_candidates:
         winner = min(available, key=_usage_sort_key)
@@ -1060,8 +1072,9 @@ def _select_relative_availability(
         return winner
     winner = (
         # Inside the top-k the draw has already been narrowed by availability;
-        # the seed only makes the pick stable for its caller.
-        min(states, key=lambda state: _decorrelated_tie_breaker(state.account_id, selection_seed))
+        # the seed only makes the pick stable for its caller. Zero-weight
+        # candidates are dropped for the same reason as in the capacity draw.
+        _seeded_account([state for state, weight in zip(states, weights, strict=True) if weight > 0.0], selection_seed)
         if selection_seed is not None
         else random.choices(states, weights=weights, k=1)[0]
     )
@@ -1070,6 +1083,11 @@ def _select_relative_availability(
             _log_relative_availability_winner(winner, current=current, weight=weight, raw_score=raw_score)
             break
     return winner
+
+
+def _seeded_account(pool: list[AccountState], seed: str) -> AccountState:
+    """The seed's choice among candidates the strategy was about to draw from."""
+    return min(pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, seed))
 
 
 def _stable_tie_breaker(account_id: str) -> str:
@@ -1211,13 +1229,25 @@ def _lowest_planner_cost_candidates(
     return [state for state in available if _planner_cost(state, routing_costs) == lowest_cost]
 
 
-def _select_capacity_weighted(available: list[AccountState]) -> AccountState:
+def _select_capacity_weighted(
+    available: list[AccountState],
+    *,
+    selection_seed: str | None = None,
+) -> AccountState:
     """Select an account with probability proportional to remaining secondary credits."""
     weights = [_remaining_secondary_credits(s) * _selection_weight_multiplier(s) for s in available]
     total = sum(weights)
     if total <= 0.0:
         # All accounts exhausted — fall back to deterministic usage-weighted
         return min(available, key=_usage_sort_key)
+    if selection_seed is not None:
+        # A zero-weight account is one the draw could never have returned while
+        # a positive-weight sibling existed -- an account whose effective
+        # secondary credits are spent. The seed must not readmit it.
+        return _seeded_account(
+            [state for state, weight in zip(available, weights, strict=True) if weight > 0.0],
+            selection_seed,
+        )
     return random.choices(available, weights=weights, k=1)[0]
 
 

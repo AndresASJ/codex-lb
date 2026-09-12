@@ -909,28 +909,28 @@ async def test_a_retained_ttl_mapping_is_kept_fresh_rather_than_left_to_expire()
     assert outcome.mutation.account_id == "hot", "the refresh must not rebind"
 
 
+_SEEDED_STRATEGIES = ("capacity_weighted", "relative_availability", "usage_weighted", "round_robin")
+# The subset whose own ordering puts the reset bucket first.
+_RESET_PREFERRING_STRATEGIES = ("capacity_weighted", "usage_weighted")
+
+
 def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
     """The seed replaces the draw, not the strategy.
 
-    ``capacity_weighted`` and ``relative_availability`` narrow to the lowest
-    planner cost before drawing, and ``prefer_earlier_reset`` narrows to the
-    soonest reset bucket. A seed spent before those filters would reroute a
-    thread onto an account the strategy had already put out of reach.
+    Every weighted strategy narrows before it draws -- to the lowest planner
+    cost, and under ``prefer_earlier_reset`` to the soonest reset bucket. A seed
+    spent before those filters would hold a thread on an account the strategy
+    had already ruled out, for as long as the isolation lasts.
     """
 
     now = 2_000_000_000.0
-    cheap, expensive = _state("cheap"), _state("expensive")
     costs = {"cheap": RoutingCost(total=1.0), "expensive": RoutingCost(total=99.0)}
-
-    soon, later = _state("soon"), _state("later")
-    soon.secondary_reset_at = int(now + 3600.0)
-    later.secondary_reset_at = int(now + 30 * 86400.0)
 
     for index in range(24):
         seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
-        for strategy in ("capacity_weighted", "relative_availability"):
+        for strategy in _SEEDED_STRATEGIES:
             by_cost = select_account(
-                [cheap, expensive],
+                [_state("cheap"), _state("expensive")],
                 now,
                 routing_strategy=strategy,
                 routing_costs=costs,
@@ -939,15 +939,75 @@ def test_a_seeded_pick_honors_the_strategy_s_own_narrowing() -> None:
             assert by_cost.account is not None
             assert by_cost.account.account_id == "cheap", f"{strategy} took the higher planner cost"
 
-        by_reset = select_account(
-            [soon, later],
-            now,
-            routing_strategy="capacity_weighted",
-            prefer_earlier_reset=True,
+            if strategy not in _RESET_PREFERRING_STRATEGIES:
+                # ``round_robin`` orders by cost and recency and
+                # ``relative_availability`` by availability; neither consults
+                # the reset bucket, seeded or not.
+                continue
+            soon, later = _state("soon"), _state("later")
+            soon.secondary_reset_at = int(now + 3600.0)
+            later.secondary_reset_at = int(now + 30 * 86400.0)
+            by_reset = select_account(
+                [soon, later],
+                now,
+                routing_strategy=strategy,
+                prefer_earlier_reset=True,
+                selection_seed=seed,
+            )
+            assert by_reset.account is not None
+            assert by_reset.account.account_id == "soon", f"{strategy} took the later reset bucket"
+
+
+def test_a_seeded_pick_skips_an_account_the_draw_could_never_have_returned() -> None:
+    """Weight zero means "spent", and a weighted draw can never return it while
+    a positive-weight sibling exists. Hashing over the raw pool could."""
+
+    now = 2_000_000_000.0
+    spent = _state("spent")
+    spent.capacity_credits = 1000.0
+    spent.secondary_used_percent = 100.0
+    live = _state("live")
+    live.capacity_credits = 1000.0
+    live.secondary_used_percent = 0.0
+
+    for index in range(24):
+        seed = isolation_substitute_seed(sticky_key=f"thread-{index}", owner_account_id="owner")
+        for strategy in ("capacity_weighted", "relative_availability"):
+            result = select_account([spent, live], now, routing_strategy=strategy, selection_seed=seed)
+            assert result.account is not None
+            assert result.account.account_id == "live", f"{strategy} routed to a spent account"
+
+
+def test_a_seeded_pick_does_not_move_as_its_own_turns_are_admitted() -> None:
+    """Stability has to survive the side effects of being used.
+
+    ``relative_availability`` admits only its top ``k`` candidates, and exact
+    ties there were broken by *recency* -- so each admitted turn advanced the
+    winner's ``last_selected_at`` and ejected it from the next turn's top-k,
+    cycling a thread through its siblings while nothing about the pool changed.
+    """
+
+    now = 2_000_000_000.0
+    pool = [_state(f"sibling-{index}") for index in range(8)]
+    for state in pool:
+        state.capacity_credits = 1000.0
+        state.secondary_used_percent = 10.0
+    seed = isolation_substitute_seed(sticky_key="thread", owner_account_id="owner")
+
+    picks = []
+    for turn in range(24):
+        result = select_account(
+            pool,
+            now + turn,
+            routing_strategy="relative_availability",
             selection_seed=seed,
         )
-        assert by_reset.account is not None
-        assert by_reset.account.account_id == "soon", "the later reset bucket was taken"
+        assert result.account is not None
+        picks.append(result.account.account_id)
+        # What admission does to the winner, and what used to eject it.
+        result.account.last_selected_at = now + turn
+
+    assert len(set(picks)) == 1, picks
 
 
 @pytest.mark.asyncio
