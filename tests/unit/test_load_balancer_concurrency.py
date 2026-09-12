@@ -3444,6 +3444,41 @@ async def test_isolated_and_capped_prompt_cache_owner_keeps_its_mapping() -> Non
 
 
 @pytest.mark.asyncio
+async def test_capped_prompt_cache_owner_that_is_gone_is_rebound() -> None:
+    """Retention is for owners that come back.
+
+    A capped owner is absent from the selection states whatever its status, so
+    the decision has to be made here, where the pre-cap states are still
+    visible: a paused owner would otherwise keep its mapping -- and, while it
+    is also isolated, keep it refreshed -- forever.
+    """
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-capped-paused")
+    assert alternate is not None
+    thread_key = "thread-capped-paused-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    owner.status = AccountStatus.PAUSED
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+    # Capped as well, so the owner leaves the selection states for a reason
+    # that on its own would have preserved the mapping.
+    saturated_leases = [await balancer.acquire_account_lease(owner.id, kind="stream") for _ in range(8)]
+
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    for lease in [*saturated_leases, selected.lease]:
+        await balancer.release_account_lease(lease)
+
+
+@pytest.mark.asyncio
 async def test_reallocate_sticky_still_rebinds_capped_prompt_cache_owner() -> None:
     balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-reallocate-capped")
     assert alternate is not None

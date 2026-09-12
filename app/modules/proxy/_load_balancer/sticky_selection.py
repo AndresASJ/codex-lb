@@ -737,6 +737,11 @@ async def run_sticky_selection_path(
                 # alternate for this request so the conversation returns to
                 # its warm owner next turn. A PAUSED/DEACTIVATED owner or one
                 # outside the request's continuity scope is still rebound.
+                # The PAUSED/DEACTIVATED half of that rule needs no test here:
+                # ``_selectable_accounts`` drops both before ``_build_states``,
+                # so such an owner never reaches ``states`` and this predicate
+                # is already false for it. Only the exclusion arm below can see
+                # an owner outside that filter, and it checks the status.
                 preserve_existing_mapping = any(state.account_id == sticky_existing_account_id for state in states) or (
                     sticky_existing_account_id in request.exclude_account_ids
                     and any(
@@ -1614,6 +1619,21 @@ async def _select_with_stickiness(
                     overload_backoff_runtime,
                     owner_account_id=pinned.account_id,
                     now=now,
+                )
+            elif overload_backoff_runtime is not None and overload_isolation_active(
+                overload_backoff_runtime.get(pinned.account_id), now
+            ):
+                # Isolated but past recovering, so the fallback below rebinds
+                # the mapping. That is still an isolation release and belongs
+                # in the same counter, or the metric reports only the reversible
+                # half of what isolation does to a conversation.
+                logger.info(
+                    "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d "
+                    "mapping=%s substitute=%s",
+                    sticky_kind.value,
+                    0,
+                    "rebound",
+                    "weighted",
                 )
             if overload_reroute_pool is not None:
                 # A budget-pressured owner's replacement honors the same

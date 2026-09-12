@@ -1010,6 +1010,80 @@ def test_a_seeded_pick_does_not_move_as_its_own_turns_are_admitted() -> None:
     assert len(set(picks)) == 1, picks
 
 
+def test_a_seeded_pick_is_stable_even_when_every_sibling_is_spent() -> None:
+    """The exhausted-pool fallback is where rotation hurts most.
+
+    It orders by usage and ends in ``last_selected_at``, so when every
+    candidate is equally spent -- exactly when it runs -- being chosen is what
+    loses you the next turn.
+    """
+
+    now = 2_000_000_000.0
+    pool = [_state(f"spent-{index}") for index in range(6)]
+    for state in pool:
+        state.capacity_credits = 1000.0
+        state.secondary_used_percent = 100.0
+    seed = isolation_substitute_seed(sticky_key="thread", owner_account_id="owner")
+
+    for strategy in ("capacity_weighted", "relative_availability"):
+        picks = []
+        for turn in range(24):
+            result = select_account(pool, now + turn, routing_strategy=strategy, selection_seed=seed)
+            assert result.account is not None
+            picks.append(result.account.account_id)
+            result.account.last_selected_at = now + turn
+        assert len(set(picks)) == 1, f"{strategy}: {picks}"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_that_is_gone_is_rebound_rather_than_refreshed() -> None:
+    """Retention is for owners that come back.
+
+    A paused or deactivated owner is not "isolated, will recover" -- it is
+    gone, so the mapping is released on this turn rather than held (and kept
+    refreshed) for the isolation window.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+    gone = _state("hot")
+    gone.status = AccountStatus.DEACTIVATED
+
+    outcome = await _select_sticky_outcome(
+        balancer,
+        [gone, _state("clean")],
+        _sticky_repo("hot"),
+    )
+
+    assert outcome.selection.account is not None
+    assert outcome.selection.account.account_id == "clean"
+    assert outcome.mutation is not None
+    assert outcome.mutation.account_id != "hot", "a deactivated owner must be released, not refreshed"
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_isolation_release_is_logged_as_rebound(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both halves of what isolation does to a conversation are counted."""
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+    gone = _state("hot")
+    gone.status = AccountStatus.PAUSED
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    await _select_sticky_outcome(balancer, [gone, _state("clean")], _sticky_repo("hot"))
+
+    messages = [record.getMessage() for record in caplog.records]
+    released = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
+    assert released, messages
+    assert "mapping=rebound" in released[0]
+    assert "hot" not in released[0] and "clean" not in released[0]
+
+
 @pytest.mark.asyncio
 async def test_a_capped_isolated_owner_is_kept_fresh_even_though_it_never_reached_selection() -> None:
     """Retention has a second door.

@@ -1044,7 +1044,11 @@ def _select_relative_availability(
         stable_membership=selection_seed is not None,
     )
     if not weighted_candidates:
-        winner = min(available, key=_usage_sort_key)
+        winner = (
+            _seeded_least_used(available, selection_seed)
+            if selection_seed is not None
+            else min(available, key=_usage_sort_key)
+        )
         _log_relative_availability_winner(
             winner,
             current=current,
@@ -1062,7 +1066,11 @@ def _select_relative_availability(
     weights = [weight * _selection_weight_multiplier(state) for state, weight, _ in weighted_candidates]
     total = sum(weights)
     if total <= 0.0:
-        winner = min(available, key=_usage_sort_key)
+        winner = (
+            _seeded_least_used(available, selection_seed)
+            if selection_seed is not None
+            else min(available, key=_usage_sort_key)
+        )
         _log_relative_availability_winner(
             winner,
             current=current,
@@ -1088,6 +1096,19 @@ def _select_relative_availability(
 def _seeded_account(pool: list[AccountState], seed: str) -> AccountState:
     """The seed's choice among candidates the strategy was about to draw from."""
     return min(pool, key=lambda state: _decorrelated_tie_breaker(state.account_id, seed))
+
+
+def _seeded_least_used(available: list[AccountState], seed: str) -> AccountState:
+    """The exhausted-pool fallback, made stable for a seeded caller.
+
+    ``min(available, key=_usage_sort_key)`` ends in ``last_selected_at``, so
+    when every candidate is equally spent -- which is exactly when this
+    fallback runs -- being chosen is what loses you the next turn, and the
+    caller's thread rotates through the tied accounts. Seed the tie instead,
+    keeping the usage ordering that decides which accounts are tied at all.
+    """
+    least_used = min(_usage_sort_key(state)[:2] for state in available)
+    return _seeded_account([state for state in available if _usage_sort_key(state)[:2] == least_used], seed)
 
 
 def _stable_tie_breaker(account_id: str) -> str:
@@ -1239,6 +1260,8 @@ def _select_capacity_weighted(
     total = sum(weights)
     if total <= 0.0:
         # All accounts exhausted — fall back to deterministic usage-weighted
+        if selection_seed is not None:
+            return _seeded_least_used(available, selection_seed)
         return min(available, key=_usage_sort_key)
     if selection_seed is not None:
         # A zero-weight account is one the draw could never have returned while
