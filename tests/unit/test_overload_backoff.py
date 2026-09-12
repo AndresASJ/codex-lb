@@ -1130,6 +1130,32 @@ async def test_an_owner_that_is_gone_is_rebound_rather_than_refreshed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_release_that_did_not_happen_is_not_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counter measures releases, not intentions.
+
+    An isolated owner past recovering is logged as rebound only once a
+    different account has actually been selected -- the request may instead
+    fail outright, and a release that never happened must not appear in the
+    metric the rollout is judged by.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    balancer._runtime["hot"] = _isolated_runtime(clock.time())
+    gone = _state("hot")
+    gone.status = AccountStatus.DEACTIVATED
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    outcome = await _select_sticky_outcome(balancer, [gone], _sticky_repo("hot"))
+
+    assert outcome.selection.account is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert not [message for message in messages if "sticky_owner_overload_isolation_reroute" in message], messages
+
+
+@pytest.mark.asyncio
 async def test_a_permanent_isolation_release_is_logged_as_rebound(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1575,7 +1601,6 @@ async def test_request_local_isolation_release_is_logged_as_retained(
     retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
     assert retained, messages
     assert "mapping=retained" in retained[0]
-    assert "substitute=deterministic" in retained[0]
     # Account identifiers must not leak onto this unflagged diagnostic.
     assert "hot" not in retained[0] and "clean" not in retained[0]
 
@@ -1672,7 +1697,6 @@ async def test_a_capped_isolated_owner_s_release_is_logged_as_retained_too(
     retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
     assert retained, messages
     assert "mapping=retained" in retained[0]
-    assert "substitute=deterministic" in retained[0]
     assert "hot" not in retained[0] and "clean" not in retained[0]
 
 

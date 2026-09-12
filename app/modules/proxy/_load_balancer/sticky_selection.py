@@ -1481,6 +1481,9 @@ async def _select_with_stickiness(
     # further down, so the caller's intent is captured before that happens.
     caller_requested_reallocation = reallocate_sticky
     overload_reroute_request_local = False
+    # Set when an isolation release is known to be permanent but its
+    # replacement is not chosen yet.
+    log_rebound_release_if_replaced = False
 
     def _choose_from(candidates: list[AccountState], *, selection_seed: str | None = None) -> SelectionResult:
         return _select_account_preferring_budget_safe(
@@ -1638,15 +1641,11 @@ async def _select_with_stickiness(
                 # Isolated but past recovering, so the fallback below rebinds
                 # the mapping. That is still an isolation release and belongs
                 # in the same counter, or the metric reports only the reversible
-                # half of what isolation does to a conversation.
-                logger.info(
-                    "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d "
-                    "mapping=%s substitute=%s",
-                    sticky_kind.value,
-                    0,
-                    "rebound",
-                    "weighted",
-                )
+                # half of what isolation does to a conversation. Deferred until
+                # the fallback has actually chosen a different account: the
+                # request may yet fail, or keep the owner, and a release that
+                # did not happen must not be counted.
+                log_rebound_release_if_replaced = True
             if overload_reroute_pool is not None:
                 # A budget-pressured owner's replacement honors the same
                 # secondary-budget filter the budget reallocation applies, so
@@ -1676,7 +1675,6 @@ async def _select_with_stickiness(
                         owner_account_id=pinned.account_id,
                     ),
                 )
-                substitute_is_stable = candidate.account is not None
                 if candidate.account is not None and candidate.account.account_id != pinned.account_id:
                     overload_reroute = candidate
                     overload_reroute_request_local = not caller_requested_reallocation
@@ -1689,12 +1687,10 @@ async def _select_with_stickiness(
                     # accounts-per-conversation factor: it says this turn went
                     # to a sibling *without* adding an owner to the thread.
                     logger.info(
-                        "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d "
-                        "mapping=%s substitute=%s",
+                        "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
                         sticky_kind.value,
                         len(overload_reroute_pool),
                         "retained" if overload_reroute_request_local else "rebound",
-                        "deterministic" if substitute_is_stable else "weighted",
                     )
                 else:
                     overload_reroute_pool = None
@@ -1899,8 +1895,7 @@ async def _select_with_stickiness(
                 fallback_candidates,
                 selection_seed=isolation_substitute_seed(sticky_key=sticky_key, owner_account_id=existing),
             )
-            substitute_is_stable = seeded.account is not None
-            if substitute_is_stable:
+            if seeded.account is not None:
                 chosen = seeded
             serving = chosen.account
             if serving is not None and serving.account_id != existing:
@@ -1910,13 +1905,24 @@ async def _select_with_stickiness(
                 # undercount exactly the releases this change is measured by.
                 # Account identifiers stay out, as on the branch above.
                 logger.info(
-                    "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d "
-                    "mapping=%s substitute=%s",
+                    "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
                     sticky_kind.value,
                     len(fallback_candidates),
                     "retained",
-                    "deterministic" if substitute_is_stable else "weighted",
                 )
+    if (
+        log_rebound_release_if_replaced
+        and chosen.account is not None
+        and isinstance(existing, str)
+        and chosen.account.account_id != existing
+    ):
+        # Account identifiers stay out, as on the retained line above.
+        logger.info(
+            "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
+            sticky_kind.value,
+            len(fallback_candidates),
+            "rebound",
+        )
     if pending_mutation is None and sticky_max_age_seconds is not None and owner_isolated_off_pool:
         # The owner is isolated and its mapping is being kept, but it never
         # reached ``selection_states`` -- a cap or this request's exclusion
