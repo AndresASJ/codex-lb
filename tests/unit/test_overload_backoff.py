@@ -1581,6 +1581,43 @@ async def test_request_local_isolation_release_is_logged_as_retained(
 
 
 @pytest.mark.asyncio
+async def test_ordinary_spillover_keeps_its_load_proportional_draw() -> None:
+    """Stability is bought for a reason, and only where there is one.
+
+    An owner that is merely capped or retry-excluded is coming back this turn
+    or the next on a healthy pool. Seeding that spillover would trade the
+    pool's load-proportional draw -- and its recovery probes -- for a stability
+    nothing is asking for.
+    """
+
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    balancer = LoadBalancer(_mock_repo_factory, clock=clock)
+    # No isolation anywhere: this is ordinary request-local spillover.
+    states = [_state(f"sibling-{index}") for index in range(6)]
+
+    picks = set()
+    for index, state in enumerate(states):
+        state.used_percent = float(index)
+    for _ in range(40):
+        outcome = await _select_sticky_outcome(
+            balancer,
+            states,
+            _sticky_repo("hot"),
+            preserve_existing_mapping_on_fallback=True,
+        )
+        assert outcome.selection.account is not None
+        picks.add(outcome.selection.account.account_id)
+        for state in states:
+            if state.account_id == outcome.selection.account.account_id:
+                state.used_percent = (state.used_percent or 0.0) + 3.0
+
+    # A load-proportional draw visits most of the pool over 40 turns; a seeded
+    # one visits a single account (and at most one more, once the first crosses
+    # the budget threshold).
+    assert len(picks) >= 4, f"spillover stopped following usage: {sorted(picks)}"
+
+
+@pytest.mark.asyncio
 async def test_an_ambiguously_owned_mapping_is_not_treated_as_a_warm_owner() -> None:
     """Not every preserved mapping is a warm owner waiting out isolation.
 

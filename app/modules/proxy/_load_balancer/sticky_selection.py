@@ -1882,13 +1882,19 @@ async def _select_with_stickiness(
         if chosen.account is None and fallback_candidates is not states:
             fallback_candidates = states
             chosen = _choose_from(states)
-        # When the mapping is being *kept* while its owner sits out this turn
-        # -- cap-filtered or excluded by this request's retry loop, so it never
-        # reached ``selection_states`` and the isolation branch above could not
-        # see a ``pinned`` state -- the substitute is re-picked on every turn
-        # just as it is there, so it gets the same thread-seeded pick. The seed
-        # is spent inside the selector, so the pool-relative gates all hold.
-        if preserve_existing_mapping_on_fallback and isinstance(existing, str) and chosen.account is not None:
+        # When an *isolated* owner's mapping is being kept while it sits out
+        # this turn -- cap-filtered or excluded by this request's retry loop,
+        # so it never reached ``selection_states`` and the isolation branch
+        # above could not see a ``pinned`` state -- the substitute is re-picked
+        # on every turn just as it is there, so it gets the same thread-seeded
+        # pick. The seed is spent inside the selector, so the pool-relative
+        # gates all hold.
+        #
+        # Only for isolation. Ordinary cap or retry spillover is a one-turn
+        # detour on a healthy pool, and seeding it would trade that pool's
+        # load-proportional draw (and its recovery probes) for stability
+        # nothing is asking for.
+        if owner_isolated_off_pool and isinstance(existing, str) and chosen.account is not None:
             seeded = _choose_from(
                 fallback_candidates,
                 selection_seed=isolation_substitute_seed(sticky_key=sticky_key, owner_account_id=existing),
@@ -1897,7 +1903,7 @@ async def _select_with_stickiness(
             if substitute_is_stable:
                 chosen = seeded
             serving = chosen.account
-            if owner_isolated_off_pool and serving is not None and serving.account_id != existing:
+            if serving is not None and serving.account_id != existing:
                 # This is an isolation release too -- the owner is isolated and
                 # a sibling is serving its turn -- so it belongs in the same
                 # counter. Leaving it to the generic spillover line would
