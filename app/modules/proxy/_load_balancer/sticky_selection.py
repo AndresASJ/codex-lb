@@ -1480,6 +1480,13 @@ async def _select_with_stickiness(
     # asked for reallocation: ``reallocate_sticky`` is an explicit instruction
     # to retire the mapping and the isolation reroute reuses the same local
     # further down, so the caller's intent is captured before that happens.
+    #
+    # ``STICKY_THREAD`` is the exception, because on that kind the flag carries
+    # no per-request intent to respect: ``affinity.py`` sets it on *every*
+    # sticky-thread policy (see ``_resolve_affinity_policy``), so reading it as
+    # "this caller asked to retire the mapping" would exempt the whole kind
+    # from retention and leave it accumulating an owner per isolation episode --
+    # while the two kinds either side of it stopped.
     caller_requested_reallocation = reallocate_sticky and sticky_kind != StickySessionKind.STICKY_THREAD
     overload_reroute_request_local = False
     # A mapping kept because the conversation's owner is *ambiguous* is not a
