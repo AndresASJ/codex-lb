@@ -4,7 +4,7 @@
 
 ### Requirement: A single account's rejection is not the pool's rejection
 
-When a pre-visible upstream failure reports `excludes_account = true` on a request that is not owner-bound, the proxy MUST exclude the rejecting account for the remainder of that request and reselect from the accounts that remain, and MUST repeat this until either a selected account serves the request or no non-excluded candidate remains. `excludes_account` is the classifier's account-selection predicate: a model-capacity rejection on a walkable class is false, while quota, rate-limit, usage-limit, and burst-rejection failures that selection may move away from are true. The proxy MUST NOT bound this walk by a fixed attempt count unrelated to the size of the usable pool.
+When deterministic failover is enabled and a pre-visible upstream failure reports `excludes_account = true` on a request that is not owner-bound, the proxy MUST exclude the rejecting account for the remainder of that request and reselect from the accounts that remain, and MUST repeat this until either a selected account serves the request or no non-excluded candidate remains. `excludes_account` is the classifier's account-selection predicate: a model-capacity rejection on a walkable class is false, while quota, rate-limit, usage-limit, and burst-rejection failures that selection may move away from are true. When deterministic failover is disabled, the proxy MUST keep the existing surface-without-walk behavior. The proxy MUST NOT bound an enabled walk by a fixed attempt count unrelated to the size of the usable pool.
 
 The walk MUST terminate. Termination MUST be guaranteed by three independent bounds: the request budget deadline that already clamps every attempt; a runaway ceiling derived from the current candidate count, so it scales with any valid pool size and cannot become the ordinary bound; and a monotone-progress invariant requiring every `failover_next` outcome to grow the request-scoped excluded-account set. When a `failover_next` outcome does not grow that set, the proxy MUST log a warning naming the request and MUST terminate the walk rather than reselect.
 
@@ -12,7 +12,7 @@ The monotone-progress invariant governs failover outcomes only. An account-capac
 
 The proxy MUST record account health exactly once per attempted failover outcome. A walk across N accounts whose pre-visible failures each produce one `failover_next` outcome MUST produce N health writes. Same-account retry and post-refresh paths that perform another upstream dispatch on the same account MAY record that distinct dispatch result, as required by their existing retry-health contract; they MUST NOT duplicate a health write for the same dispatch outcome.
 
-Owner-bound requests are outside the relocation part of this requirement: a request that cannot move to another account MUST continue to return through the `owner_bound` branch and MUST NOT walk the pool. Burst rejections may still use the bounded same-account retry path. Usage-limit messages, including code-less and `invalid_request_error` envelopes, still use the new classification and same-account-backoff skip before their original rejection is surfaced.
+Owner-bound requests are outside the relocation part of this requirement: a request that cannot move to another account MUST continue to return through the `owner_bound` branch and MUST NOT walk the pool. Burst rejections may still use the bounded same-account retry path. Required previous-response-owner compact requests are not owner-bound when the existing account-neutral fresh-replay gates have proven that their replay can safely move to another account after a pre-visible quota or rate-limit owner failure; those verified compact replays may use the walk. Usage-limit messages, including code-less and `invalid_request_error` envelopes, still use the new classification and same-account-backoff skip before their original rejection is surfaced.
 
 When a walk ends without a served response, the proxy MUST record which bound ended it — a non-retryable failure, an exhausted pool, the request deadline, the runaway ceiling, or a progress failure. Those outcomes are operationally different and MUST be distinguishable after the fact; collapsing them into one undifferentiated "surface" leaves an operator unable to tell a bad request from an exhausted fleet.
 
@@ -45,7 +45,7 @@ When a walk ends without a served response, the proxy MUST record which bound en
 
 #### Scenario: Owner-bound requests keep today's behaviour
 
-- **GIVEN** a request bound to account A by a required previous-response owner, a file pin, turn-state ownership, or the `single_account` routing strategy
+- **GIVEN** a request bound to account A by a file pin, turn-state ownership, the `single_account` routing strategy, or a required previous-response owner that has not passed the account-neutral fresh-replay gates
 - **WHEN** account A returns a pre-visible failure
 - **THEN** the proxy does not walk the pool
 - **AND** burst rejections keep the bounded same-account retry path
@@ -53,16 +53,16 @@ When a walk ends without a served response, the proxy MUST record which bound en
 
 ### Requirement: A walk proves exhaustion from its own attempts
 
-When a walk has attempted every candidate the selector offered and excluded each of them on exhaustion evidence, the proxy MUST treat the pool as exhausted, whether or not the persisted-state exhaustion predicate can see it yet.
+When a walk has attempted every candidate the selector offered and excluded each of them on usage-window exhaustion evidence, the proxy MUST treat the pool as exhausted, whether or not the persisted-state exhaustion predicate can see it yet.
 
 The proxy MUST NOT make this conclusion depend on a background or debounced usage refresh, which cannot land before the terminal decision of the request that provoked it. It MUST NOT depend on writing a usage sample onto the transient account state either: the runtime state the health write persists carries the account's status but not that sample, so a sample written during the attempt does not survive to be read back.
 
-The walk therefore MUST carry its own per-account evidence to the terminal decision, and the terminal decision MUST accept it. The persisted-state probe remains authoritative for the case the walk cannot speak to — a request that never attempted the whole pool, because selection refused it earlier.
+The walk therefore MUST carry its own per-account evidence to the terminal decision, and the terminal decision MUST accept it only when that evidence proves usage-window exhaustion: a coded `usage_limit_reached`, a message-derived usage-limit rejection, or quota evidence that carries the same structured usage-window meaning. Other quota-class errors, such as `usage_not_included` or `insufficient_quota`, still exclude the account when selection may move away, but they MUST NOT by themselves authorize a canonical `usage_limit_reached` pool response. The persisted-state probe remains authoritative for the case the walk cannot speak to — a request that never attempted the whole pool, because selection refused it earlier.
 
 #### Scenario: Every attempted account was exhausted
 
 - **GIVEN** a walk that attempted every account the selector offered
-- **AND** each of them was excluded on usage-limit or quota evidence
+- **AND** each of them was excluded on usage-window exhaustion evidence
 - **WHEN** the walk ends
 - **THEN** the pool is treated as exhausted without waiting for any background refresh
 - **AND** the client receives the canonical `usage_limit_reached` rejection

@@ -73,7 +73,9 @@ is exhausted.
   `owner_bound` branch of `failover_decision` before the walk is reached.
   Burst 429s keep the bounded same-account backoff; code-less or
   `invalid_request_error` usage-limit messages still change classification and
-  skip same-account backoff before surfacing on the owner.
+  skip same-account backoff before surfacing on the owner. Required
+  previous-response-owner compact requests remain eligible for their existing
+  account-neutral fresh-replay path when those gates prove safe relocation.
 - Exactly one account-health write per attempted account per request.
 
 ## Impact
@@ -86,8 +88,9 @@ is exhausted.
 - **Clients** that today receive one account's 429 while other accounts are
   usable now receive a served response. An unbound request receives the
   canonical exhausted-pool 429 with `error.resets_at` only when the
-  pool-exhaustion probe or the walk's own exhaustion evidence confirms
-  exhaustion. Other terminal paths preserve their existing failure contract.
+  pool-exhaustion probe or the walk's own usage-window exhaustion evidence
+  confirms exhaustion. Other terminal paths preserve their existing failure
+  contract.
 - **Operators**: no new setting. The runaway fence is derived from the current
   candidate count, not from a fixed operator knob. The `[settings_fields]`
   ratchet does not move.

@@ -111,5 +111,6 @@
   allowed additional dispatch outcomes, not duplicate writes for one outcome.
 - [ ] Confirm the `[settings_fields]` ratchet does not move and no new
   `CODEX_LB_*` name is introduced.
-- [ ] `openspec validate --specs`, `uv run ruff check`,
+- [ ] `openspec validate walk-account-pool-before-surfacing-429 --strict`,
+  `openspec validate --specs`, `uv run ruff check`,
   `codex review --base origin/main`.
