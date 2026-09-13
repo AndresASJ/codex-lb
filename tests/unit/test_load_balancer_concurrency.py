@@ -3480,6 +3480,43 @@ def _make_probing_pool_balancer(
 
 
 @pytest.mark.asyncio
+async def test_a_retained_release_is_counted_once_admission_succeeded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counter is emitted from the admitted path, not from selection.
+
+    Selection can still lose its candidate to a concurrent lease, or be retried
+    on stale account state; a release that never served must not appear in the
+    metric the accounts-per-conversation change is judged by, and a retried
+    attempt must not appear twice.
+    """
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-counted-release")
+    assert alternate is not None
+    thread_key = "thread-counted-release-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    messages = [record.getMessage() for record in caplog.records]
+    retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
+    assert len(retained) == 1, messages
+    assert "mapping=retained" in retained[0]
+    assert owner.id not in retained[0] and alternate.id not in retained[0]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
 async def test_retained_thread_does_not_rotate_through_due_probes() -> None:
     """The public routing path, with probing siblings in the pool.
 

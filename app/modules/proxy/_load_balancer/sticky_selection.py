@@ -361,6 +361,12 @@ class _StickySelectionOutcome:
     # was chosen for the key (overload-free first pass); ``None`` means the
     # caller's full pool. Probe reservation must use the same pool.
     effective_states: list[AccountState] | None = None
+    # ``(mapping, overload_free_candidates)`` when this selection released an
+    # isolated sticky owner. Carried rather than logged, because selection can
+    # still lose the candidate to a concurrent lease or be retried on stale
+    # state -- and a release that never served must not reach the counter. The
+    # caller emits it once admission has actually succeeded.
+    isolation_release: tuple[str, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1364,6 +1370,21 @@ async def run_sticky_selection_path(
                     await owner.release_account_lease(selected_lease)
                     selected_lease = None
                     raise
+        if sticky_outcome.isolation_release is not None:
+            # Here, not at selection: the candidate can still be lost to a
+            # concurrent lease or the attempt retried on stale state, and this
+            # counter is the one the accounts-per-conversation change is judged
+            # by -- a release that never served must not appear in it, and a
+            # retried attempt must not appear twice. Account identifiers are
+            # deliberately omitted: this path has no privacy flag and private
+            # realtime diagnostics must not expose them.
+            release_mapping, overload_free_candidates = sticky_outcome.isolation_release
+            logger.info(
+                "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
+                sticky_kind.value if sticky_kind is not None else "unknown",
+                overload_free_candidates,
+                release_mapping,
+            )
         break
 
     return StickySelectionOutcome(
@@ -1446,7 +1467,12 @@ async def _select_with_stickiness(
                 account_id=persist_account_id,
                 refresh_skip_deadline=refresh_skip_deadline,
             )
-        return _StickySelectionOutcome(selection=selection, mutation=mutation, effective_states=effective_states)
+        return _StickySelectionOutcome(
+            selection=selection,
+            mutation=mutation,
+            effective_states=effective_states,
+            isolation_release=isolation_release,
+        )
 
     if sticky_existing_account_id is _STICKY_EXISTING_UNSET:
         existing = await sticky_repo.get_account_id(
@@ -1489,6 +1515,7 @@ async def _select_with_stickiness(
     # while the two kinds either side of it stopped.
     caller_requested_reallocation = reallocate_sticky and sticky_kind != StickySessionKind.STICKY_THREAD
     overload_reroute_request_local = False
+    isolation_release: tuple[str, int] | None = None
     # A mapping kept because the conversation's owner is *ambiguous* is not a
     # warm owner waiting out isolation: it may sit outside this request's
     # routable or security scope. It still keeps its row -- ambiguity is a
@@ -1688,12 +1715,9 @@ async def _select_with_stickiness(
                     # accounts-per-conversation factor: it says this turn went
                     # to a sibling *without* adding an owner to the thread.
                     if retention_may_write or not overload_reroute_request_local:
-                        logger.info(
-                            "sticky_owner_overload_isolation_reroute sticky_kind=%s "
-                            "overload_free_candidates=%d mapping=%s",
-                            sticky_kind.value,
-                            len(overload_reroute_pool),
+                        isolation_release = (
                             "retained" if overload_reroute_request_local else "rebound",
+                            len(overload_reroute_pool),
                         )
                 else:
                     overload_reroute_pool = None
@@ -1933,12 +1957,7 @@ async def _select_with_stickiness(
                 # counter. Leaving it to the generic spillover line would
                 # undercount exactly the releases this change is measured by.
                 # Account identifiers stay out, as on the branch above.
-                logger.info(
-                    "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
-                    sticky_kind.value,
-                    len(fallback_candidates),
-                    "retained",
-                )
+                isolation_release = ("retained", len(fallback_candidates))
     if (
         isinstance(existing, str)
         and chosen.account is not None
@@ -1964,12 +1983,7 @@ async def _select_with_stickiness(
         # Emitted here, where the replacement is known: the request may instead
         # have failed, or kept its owner, and a release that did not happen must
         # not be counted. Account identifiers stay out, as on the retained line.
-        logger.info(
-            "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d mapping=%s",
-            sticky_kind.value,
-            len(fallback_candidates),
-            "rebound",
-        )
+        isolation_release = ("rebound", len(fallback_candidates))
     if pending_mutation is None and sticky_max_age_seconds is not None and owner_isolated_off_pool:
         # The owner is isolated and its mapping is being kept, but it never
         # reached ``selection_states`` -- a cap or this request's exclusion

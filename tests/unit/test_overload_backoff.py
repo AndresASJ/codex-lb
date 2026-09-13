@@ -1382,14 +1382,10 @@ async def test_a_permanent_isolation_release_is_logged_as_rebound(
     gone = _state("hot")
     gone.status = AccountStatus.PAUSED
 
-    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
-    await _select_sticky_outcome(balancer, [gone, _state("clean")], _sticky_repo("hot"))
+    outcome = await _select_sticky_outcome(balancer, [gone, _state("clean")], _sticky_repo("hot"))
 
-    messages = [record.getMessage() for record in caplog.records]
-    released = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert len(released) == 1, messages
-    assert "mapping=rebound" in released[0]
-    assert "hot" not in released[0] and "clean" not in released[0]
+    assert outcome.isolation_release is not None
+    assert outcome.isolation_release[0] == "rebound"
 
 
 @pytest.mark.asyncio
@@ -1776,16 +1772,13 @@ async def test_isolated_and_capped_bare_session_owner_keeps_its_request_local_sp
 
 
 @pytest.mark.asyncio
-async def test_explicit_reallocation_still_retires_an_isolated_owner(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_explicit_reallocation_still_retires_an_isolated_owner() -> None:
     """``reallocate_sticky`` is an explicit instruction to retire the mapping.
     Isolation retention must not silently override it."""
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     balancer = LoadBalancer(_mock_repo_factory, clock=clock)
     balancer._runtime["hot"] = _isolated_runtime(clock.time())
 
-    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
     outcome = await _select_sticky_outcome(
         balancer,
         [_state("hot"), _state("clean")],
@@ -1795,7 +1788,8 @@ async def test_explicit_reallocation_still_retires_an_isolated_owner(
     assert outcome.selection.account is not None
     assert outcome.selection.account.account_id == "clean"
     assert outcome.mutation is not None and outcome.mutation.account_id == "clean"
-    assert "mapping=rebound" in caplog.text
+    assert outcome.isolation_release is not None
+    assert outcome.isolation_release[0] == "rebound"
 
 
 @pytest.mark.asyncio
@@ -1837,12 +1831,13 @@ async def test_request_local_isolation_release_is_logged_as_retained(
     outcome = await _select_sticky_outcome(balancer, [_state("hot"), _state("clean")], _sticky_repo("hot"))
 
     _assert_owner_retained(outcome, "hot")
-    messages = [record.getMessage() for record in caplog.records]
-    retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert len(retained) == 1, messages
-    assert "mapping=retained" in retained[0]
-    # Account identifiers must not leak onto this unflagged diagnostic.
-    assert "hot" not in retained[0] and "clean" not in retained[0]
+    # The diagnostic is carried, not logged: selection can still lose the
+    # candidate to a concurrent lease, so the caller emits it once admission
+    # has succeeded (covered end-to-end in test_load_balancer_concurrency).
+    assert outcome.isolation_release is not None
+    mapping, candidates = outcome.isolation_release
+    assert mapping == "retained"
+    assert candidates == 1
 
 
 @pytest.mark.asyncio
@@ -1988,11 +1983,8 @@ async def test_a_capped_isolated_owner_s_release_is_logged_as_retained_too(
     )
 
     assert outcome.selection.account is not None
-    messages = [record.getMessage() for record in caplog.records]
-    retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
-    assert len(retained) == 1, messages
-    assert "mapping=retained" in retained[0]
-    assert "hot" not in retained[0] and "clean" not in retained[0]
+    assert outcome.isolation_release is not None
+    assert outcome.isolation_release[0] == "retained"
 
 
 @pytest.mark.asyncio
