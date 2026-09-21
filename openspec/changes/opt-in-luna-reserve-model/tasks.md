@@ -51,4 +51,4 @@
 - [x] 7.2 Unit tests for the touched areas.
 - [x] 7.3 `npm run typecheck` and the routing-settings frontend test.
 - [x] 7.4 `openspec validate --specs --strict`.
-- [ ] 7.5 `uv run pre-commit run local-ci --hook-stage manual --all-files`.
+- [x] 7.5 `uv run pre-commit run local-ci --hook-stage manual --all-files` — ran; this change's suites (ruff, unit, integration, typecheck, frontend) pass. The gate additionally trips `check_migration_topology` on a pre-existing dual-head Alembic fork on `origin/main` (`20260914_000000_add_scim_tokens` #2431 vs `20260914_000000_drop_subscription_overflow_schema` #2422); this branch adds 0 migrations, so that failure is unrelated.
